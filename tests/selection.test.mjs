@@ -153,7 +153,8 @@ test('上方 dock 渲染完整原文卡片及移除操作，不调用输入框�
     document: { createElement: () => ({ dataset: {}, remove() {} }), head: { append() {} } },
     sessionStorage: { getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v) } });
   plugin.apply({ effect: fn => fn(), slots: { inject: (_, fn) => fn(), register: (options, Component) => { if (options.name === 'conversation.input.dock') Dock = Component; return () => {}; } },
-    sessions: {}, resources: { register: () => () => {} }, sidebarRightTabs: { register: () => () => {} } });
+    sessions: { list: { getSnapshot: () => ({ ids: [], byId: {} }) } }, sidebarRight: { registerCloseHandler: () => () => {} },
+    resources: { register: () => () => {} }, sidebarRightTabs: { register: () => () => {} } });
   const render = () => Dock({ sessionId: 'a', useInput: fn => fn({ phase: 'plain', draft: '我的问题' }),
     inputActions: { insertText: () => assert.fail('不能修改输入框'), setDraft: () => assert.fail('不能替换草稿') } });
   const tree = render(), nodes = [];
@@ -176,28 +177,27 @@ test('资源释放只移除会话引用，关闭侧栏不会取消模型或删�
 });
 test('快速重复点击只创建一次，打开失败后重试复用既有分支', async () => {
   let forks = 0, opens = 0, remembered = 0;
-  const op = p.createBranchOp({ fork: async opts => { forks++; assert.equal(opts.sessionId, 'main'); assert.equal(opts.allowMigration, false); return 'child'; } }, async () => { if (++opens === 1) throw Error('暂不可打开'); }, () => remembered++);
+  const op = p.createBranchOp(async (action, opts) => { forks++; assert.equal(action, 'create'); assert.equal(opts.sourceId, 'main'); return { id: 'child' }; }, async () => { if (++opens === 1) throw Error('暂不可打开'); }, () => remembered++, () => 'request-1');
   const input = { sessionId: 'main', text: '引文', isCurrent: () => true };
   const first = op(input), duplicate = op(input); assert.equal(first, duplicate);
   await assert.rejects(first, /暂不可打开/); assert.equal(await op(input), 'child');
   assert.equal(forks, 1); assert.equal(opens, 2); assert.equal(remembered, 1);
 });
-test('切换会话或卸载后不会抢开侧栏，已创建的引用保留待恢复', async () => {
-  let remembered;
-  const op = p.createBranchOp({ fork: async () => 'child' }, () => assert.fail('不应打开'), (...args) => { remembered = args; });
+test('切换会话或卸载后不会抢开侧栏，未展示的临时会话自动清理', async () => {
+  let remembered, closed;
+  const op = p.createBranchOp(async (action, input) => { if (action === 'close') closed = input.id; return { id: 'child' }; }, () => assert.fail('不应打开'), (...args) => { remembered = args; }, () => 'request-2');
   assert.equal(await op({ sessionId: 'main', text: '引文', isCurrent: () => false }), 'child');
-  assert.deepEqual(remembered, ['child', '引文']);
+  assert.equal(remembered, undefined); assert.equal(closed, 'child');
 });
-test('网络结果不明时禁止重复创建，已知关联失败则使用返回的 ID', async () => {
-  let forks = 0;
-  const unknown = p.createBranchOp({ fork: async () => { forks++; throw Error('网络断开'); } }, () => {}, () => {});
+test('网络结果不明时用同一个请求标识重试，由后端复用同一会话', async () => {
+  const keys = [];
+  const unknown = p.createBranchOp(async (_action, input) => { keys.push(input.requestId); if (keys.length === 1) throw Error('网络断开'); return { id: 'child' }; }, () => {}, () => {}, () => 'request-3');
   const input = { sessionId: 'main', text: '引文', isCurrent: () => true };
-  await assert.rejects(unknown(input), /结果未确认/); await assert.rejects(unknown(input), /结果未确认/); assert.equal(forks, 1);
-  const attached = p.createBranchOp({ fork: async () => { throw { rpcError: { code: 'session/workspace-attach-failed', details: { sessionId: 'known-child' } } }; } }, address => assert.equal(p.parseAddress(address), 'known-child'), () => {});
-  assert.equal(await attached(input), 'known-child');
+  await assert.rejects(unknown(input), /网络断开/); assert.equal(await unknown(input), 'child');
+  assert.deepEqual(keys, ['request-3', 'request-3']);
 });
 test('没有已完成轮次时保留宿主拒绝，不偷偷创建无上下文会话', async () => {
-  const op = p.createBranchOp({ fork: async () => { const e = Error('没有已完成轮次'); e.rpcError = { code: 'session/fork-unavailable' }; throw e; } }, () => assert.fail(), () => assert.fail());
+  const op = p.createBranchOp(async () => { throw Error('没有已完成轮次'); }, () => assert.fail(), () => assert.fail(), () => 'request-4');
   await assert.rejects(op({ sessionId: 'main', text: '引文', isCurrent: () => true }), /没有已完成轮次/);
 });
 test('插件独立注册与卸载，未调用 Codex、模型或修改主会话', () => {
@@ -206,12 +206,31 @@ test('插件独立注册与卸载，未调用 Codex、模型或修改主会话',
     sessionStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) } });
   plugin.apply({ effect: fn => { const dispose = fn(); effects.push(dispose); return dispose; },
     slots: { inject: (_, fn) => fn(), register: (options, Component) => { registrations.push({ options, Component }); return () => removed.push(options.name); } },
-    sessions: {}, resources: { register: provider => { assert.equal(provider.protocol, 'selectionchat'); return () => removed.push('resource'); } },
+    sessions: { list: { getSnapshot: () => ({ ids: [], byId: {} }) } }, sidebarRight: { registerCloseHandler: () => () => removed.push('close') },
+    resources: { register: provider => { assert.equal(provider.protocol, 'selectionchat'); return () => removed.push('resource'); } },
     sidebarRightTabs: { register: definition => { assert.equal(definition.kind, 'selectionchat'); return () => removed.push('tab'); } } });
   assert.equal(registrations.length, 3);
   assert.ok(registrations.some(r => r.options.name === 'conversation.input.dock'));
-  effects.reverse().forEach(f => f?.()); assert.equal(removed.length, 6);
+  effects.reverse().forEach(f => f?.()); assert.equal(removed.length, 7);
   const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url)));
   assert.equal(pkg.name, '@local/dsh-selection-chat');
   assert.ok(!JSON.stringify(pkg).includes('codex-dots'));
+});
+
+test('临时会话不进入左侧目录，保存后的普通会话仍可见且保留 cwd 元数据', () => {
+  const snapshot = { ids: ['main', 'selectionchat-temp-123', 'session-saved'], byId: { 'selectionchat-temp-123': { cwd: '/project' } } };
+  const source = { getSnapshot: () => snapshot }, original = source.getSnapshot;
+  const dispose = p.hideTemporarySessions(source);
+  assert.deepEqual([...source.getSnapshot().ids], ['main', 'session-saved']);
+  assert.equal(source.getSnapshot(), source.getSnapshot());
+  assert.equal(source.getSnapshot().byId['selectionchat-temp-123'].cwd, '/project');
+  dispose(); assert.equal(source.getSnapshot, original);
+});
+
+test('历史隐藏只作用于当前侧栏及继承轮次，不隐藏新轮次或主对话', () => {
+  const css = p.inheritedHistoryCss('selectionchat-temp-123', [0, 1, '2', -1, '<script>']);
+  assert.ok(css.includes('[data-selection-chat-session="selectionchat-temp-123"] [data-chat-turn="0"]'));
+  assert.ok(!css.includes('turn="2"')); assert.ok(!css.includes('<script>'));
+  assert.equal(p.inheritedHistoryCss('" onclick=', [0]), '');
+  assert.ok(!source.includes('侧边分支已准备，填写问题后手动发送。'));
 });

@@ -62,6 +62,8 @@ async function main() {
   for (const contract of ['async fork(opts)', 'retain(target, options)', 'allowMigration', 'workspaceAttachSessionId']) assert.ok(sessions.includes(contract), '缺少会话契约：' + contract);
   const sidebar = readClient('dsh-client-ui-sidebar-right');
   assert.ok(sidebar.includes('"sidebar.right.pane.tab"'));
+  assert.ok(sidebar.includes('registerCloseHandler(kind, handler)'));
+  assert.ok(sidebar.includes('this.closeHandlers.get(tab.kind)?.(sessionId, tab)'));
   const renderer = readClient('dsh-client-ui-renderer');
   assert.ok(renderer.includes('kit["SessionProvider"]'));
   assert.ok(readClient('dsh-client-ui-chat').includes('"data-chat-flow-kind"'));
@@ -69,14 +71,51 @@ async function main() {
     return next(name, name.startsWith('@deepseek-ai/') ? { ...context, parentURL: pathToFileURL(path.join(runtime, 'package.json')).href } : context);
   } });
   const { Context } = await import('@deepseek-ai/cordis');
+  const { buildForkSeed } = await import('@deepseek-ai/dsh-session');
+  const { default: AgentLoop } = await import('@deepseek-ai/dsh-agent-loop');
+  const plugin = await import(pathToFileURL(path.join(root, 'index.mjs')));
+  const { createTemporaryManager } = await import(pathToFileURL(path.join(root, 'temporary.mjs')));
   hooks.deregister();
+  // 验证真实 AgentLoop 的写句柄入口可以被定向绕过，其他会话仍调用真实方法。
+  const writes = [], effects = [], routes = [];
+  const loop = Object.create(AgentLoop.prototype);
+  loop.runtime = { ctx: { get: name => name === 'sessionPersistence' ? { create: async header => { writes.push(header.id); return { close() {} }; } } : undefined } };
+  const observations = new Map();
+  const sample = [
+    { seq: 0, type: 'turn/start', timestamp: 1, data: { turn: 0, trigger: { kind: 'user' } } },
+    { seq: 1, type: 'turn/end', timestamp: 2, data: { turn: 0, status: 'completed' } }
+  ];
+  const host = {
+    effect: fn => { const off = fn(); effects.push(off); return off; },
+    connection: { fetch: { register: route => { routes.push(route); return () => {}; } } },
+    agentLoop: loop, sessionController: { prompt() {}, agents: { composeAgent: async () => ({ setup() {} }), presetForObservation() {} } },
+    sessionQuery: { observeSession: async id => ({ events: sample, header: { id, cwd: 'C:/example' }, [Symbol.dispose]() {} }) },
+    workspaceRegistry: { list: () => [] }, agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'test' }) },
+    agents: { create: async options => {
+      const session = { id: options.sessionId, header: { id: options.sessionId }, inheritedEventCount: options.inheritedEventCount };
+      const stored = await loop.createStoredSession(session);
+      observations.set(options.sessionId, { options, stored });
+      return { agent: { status: 'idle', options: options.agentOptions }, dispose: async () => {} };
+    } }, logger: { warn() {} }
+  };
+  // 原生 buildForkSeed 负责序列化边界，测试中不自行复制 DSH 的实现。
+  const manager = createTemporaryManager(host, buildForkSeed);
+  const temporary = await manager.create({ sourceId: 'source', requestId: 'host-check-request' });
+  assert.equal(observations.get(temporary.id).stored, undefined);
+  assert.equal(writes.length, 0);
+  const saved = await manager.save(temporary.id);
+  assert.deepEqual(writes, [saved.savedId]);
+  assert.deepEqual(temporary.hiddenTurns, [0]);
+  await manager.close(temporary.id); await manager.dispose();
+  plugin.apply(host);
+  assert.deepEqual(routes.map(r => r.path).sort(), ['close', 'create', 'info', 'save'].map(op => '/api/selection-chat/' + op).sort());
+  for (const off of effects.reverse()) await off?.();
   const ctx = new Context();
   try {
-    const plugin = await import(pathToFileURL(path.join(root, 'index.mjs')));
     const fiber = await ctx.plugin(plugin);
     await fiber.dispose();
     console.log(JSON.stringify({ ok: true, plugin: pkg.name, version: pkg.version, dsh: version,
-      checks: ['真实 Cordis 后端加载和卸载', '安装包中的客户端接口与声明检查', '真实宿主序列化方法：异步芯片、附件、steer、失败恢复及引用快照'],
+      checks: ['真实 Cordis 加载及认证路由注册和卸载', '安装包中的客户端接口与声明检查', '真实宿主序列化方法：异步芯片、附件、steer、失败恢复及引用快照', '真实 AgentLoop 写句柄入口：临时跳过，保存恢复持久化；原生 fork seed'],
       limits: ['未执行真实浏览器渲染', '未新建真实会话或发送消息；界面由用户手动验收'] }));
   } finally { await ctx.fiber.dispose(); }
 }

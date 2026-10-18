@@ -6,6 +6,36 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
   const ID = '@local/dsh-selection-chat', SLOT = 'selection-chat.conversation';
   const PREFIX = 'dsh-resource://selectionchat/session/';
   const MAX_QUOTE = 100000;
+  const TEMP_PREFIX = 'selectionchat-temp-';
+  async function temporaryApi(operation, input) {
+    const transport = globalThis.__DSH_TRANSPORT__;
+    const send = transport?.fetch ? transport.fetch.bind(transport) : globalThis.fetch.bind(globalThis);
+    const response = await send('/api/selection-chat/' + operation, { method: 'POST', credentials: 'same-origin', signal: AbortSignal.timeout(30000),
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+    const result = await response.json();
+    if (!response.ok) throw Error(result.error || '侧边聊天操作失败。');
+    return result;
+  }
+  // 只从左侧目录的可见 ID 序列排除临时会话；保留 byId，供原生文件路径、模型与权限解析。
+  function hideTemporarySessions(source) {
+    const original = source.getSnapshot, cache = new WeakMap();
+    const read = () => {
+      const snapshot = original.call(source);
+      if (!cache.has(snapshot)) cache.set(snapshot, { ...snapshot, ids: snapshot.ids.filter(id => !id.startsWith(TEMP_PREFIX)) });
+      return cache.get(snapshot);
+    };
+    source.getSnapshot = read;
+    return () => { if (source.getSnapshot === read) source.getSnapshot = original; };
+  }
+  function inheritedHistoryCss(id, turns) {
+    if (!/^[a-zA-Z0-9-]+$/.test(id)) return '';
+    // Turn 是宿主整数身份，只生成有边界的选择器，不把选中文本写进 CSS。
+    const selectors = [...new Set(turns)].filter(n => Number.isSafeInteger(n) && n >= 0)
+      .map(n => `[data-selection-chat-session="${id}"] [data-chat-turn="${n}"]`);
+    if (!selectors.length) return '';
+    selectors.push(`[data-selection-chat-session="${id}"] nav[aria-label="轮次导航"]`, `[data-selection-chat-session="${id}"] nav[aria-label="Turn navigation"]`);
+    return selectors.join(',') + '{display:none!important}';
+  }
 
   function quoteText(text) {
     if (typeof text !== 'string' || !text.trim()) throw Error('请先选中一段对话正文。');
@@ -80,6 +110,10 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
         if (cards.length) rows.set(id, cards); else rows.delete(id);
         publish();
       },
+      clear(id) { rows.delete(id); publish(); },
+      move(from, to) {
+        rows.set(to, [...(rows.get(to) || []), ...(rows.get(from) || [])]); rows.delete(from); publish();
+      },
       reuse(id, cardId) {
         rows.set(id, (rows.get(id) || []).map(c => c.id === cardId && c.state === 'uncertain' ? { ...c, state: 'ready', error: undefined } : c)); publish();
       },
@@ -141,44 +175,37 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     // 卸载后不领取新引用，已获授权的在途发送仍完成原生生命周期。
     return () => { active = false; cleanup(); };
   }
-  function resourceProvider(sessions) {
+  function resourceProvider(sessions, metadata = async () => undefined) {
     return { protocol: 'selectionchat', async *open(address, { signal }) {
       const id = parseAddress(address);
       if (!id) throw Error('无效的侧边聊天地址。');
       if (signal.aborted) return;
+      const meta = await metadata(id);
+      if (signal.aborted) return;
       const reference = sessions.retain(id, { source: 'selectionChat', signal });
       try {
-        yield { ok: true, value: { id, reference } };
+        yield { ok: true, value: { id, reference, meta } };
         if (!signal.aborted) await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
       } finally { reference.release(); }
     } };
   }
   // 一次点击对应一个分支；打开侧栏失败后的重试复用已创建的会话，绝不重复派发。
-  function createBranchOp(sessions, open, remember) {
-    let task, child, uncertain;
+  function createBranchOp(api, open, remember, mint = () => crypto.randomUUID()) {
+    let task, child, requestId, remembered = false;
     return source => {
       if (task) return task;
       task = (async () => {
         quoteText(source.text);
-        if (uncertain) throw uncertain;
         if (!child) {
-          try {
-            child = await sessions.fork({ sessionId: source.sessionId, allowMigration: false, increaseTitle: false });
-          } catch (error) {
-            const rpc = error.rpcError;
-            // 宿主明确已创建但工作区关联失败时复用 ID；网络结果不明时禁止再次创建。
-            if (rpc?.code === 'session/workspace-attach-failed' && typeof rpc.details?.sessionId === 'string') child = rpc.details.sessionId;
-            else {
-              if (!['session/fork-unavailable', 'session/migration-required', 'session/not-found'].includes(rpc?.code)) {
-                uncertain = Error('分支创建结果未确认，请先检查 DSH 会话列表，避免重复创建。原错误：' + error.message);
-              }
-              throw uncertain || error;
-            }
-          }
-          remember(child, source.text);
+          requestId ||= mint();
+          child = await api('create', { sourceId: source.sessionId, requestId });
         }
-        if (source.isCurrent()) await open(resourceAddress(child));
-        return child;
+        if (source.isCurrent()) {
+          if (!remembered) { remember(child, source.text); remembered = true; }
+          await open(resourceAddress(child.id));
+        }
+        else await api('close', { id: child.id });
+        return child.id;
       })().finally(() => { task = undefined; });
       return task;
     };
@@ -188,7 +215,48 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     let storage;
     try { storage = sessionStorage; } catch { /* 隐私模式允许内存工作。 */ }
     const cards = createQuoteStore(storage), senders = new Map();
+    const metadata = new Map(), metaListeners = new Set(), cleanupQueue = new Set(), cleanupErrors = new Map(), closing = new Set();
+    const timers = new Set();
     let disposed = false;
+    try {
+      for (const [id, value] of JSON.parse(storage?.getItem('dsh-selection-chat.sessions.v1') || '[]')) metadata.set(id, value);
+      for (const id of JSON.parse(storage?.getItem('dsh-selection-chat.cleanup.v1') || '[]')) if (typeof id === 'string' && id.startsWith(TEMP_PREFIX)) cleanupQueue.add(id);
+    } catch { /* 不从损坏缓存推断删除目标。 */ }
+    const publishMeta = () => {
+      try { storage?.setItem('dsh-selection-chat.sessions.v1', JSON.stringify([...metadata])); } catch { /* 当前窗口仍可继续。 */ }
+      for (const listener of metaListeners) listener();
+    };
+    const clean = async (id, attempt = 0) => {
+      if (disposed || closing.has(id)) return;
+      closing.add(id);
+      try {
+        await temporaryApi('close', { id });
+        cleanupQueue.delete(id); cleanupErrors.delete(id); metadata.delete(id); cards.clear(id);
+        storage?.setItem('dsh-selection-chat.cleanup.v1', JSON.stringify([...cleanupQueue]));
+      } catch (error) {
+        cleanupErrors.set(id, error.message);
+        if (attempt < 2 && !disposed) {
+          const timer = setTimeout(() => { timers.delete(timer); void clean(id, attempt + 1); }, 1000 * (attempt + 1));
+          timers.add(timer);
+        }
+      } finally { closing.delete(id); publishMeta(); }
+    };
+    const queueClose = id => {
+      if (!id?.startsWith(TEMP_PREFIX)) return;
+      cleanupQueue.add(id);
+      // 关闭标签前先登记清理任务。导航、折叠、资源卸载不会触发这个入口。
+      storage?.setItem('dsh-selection-chat.cleanup.v1', JSON.stringify([...cleanupQueue]));
+      void clean(id);
+    };
+    const getMetadata = async id => {
+      if (id.startsWith(TEMP_PREFIX)) {
+        const info = await temporaryApi('info', { id });
+        if (['closed', 'closing', 'close-failed'].includes(info.state)) throw Error('此临时聊天已关闭，请重新划词打开。');
+        metadata.set(id, info); publishMeta(); return info;
+      }
+      if (!metadata.has(id)) { metadata.set(id, await temporaryApi('info', { id })); publishMeta(); }
+      return metadata.get(id);
+    };
     const remember = (id, text) => cards.add(id, text);
     const ensureSender = id => {
       const binding = ctx.sessions.binding(id);
@@ -203,6 +271,12 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
       document.head.append(style);
       style.textContent += `.dsh-sc-cards{width:100%;box-sizing:border-box;max-height:240px;overflow:auto;margin:0 0 8px;padding:0 4px;display:flex;flex-direction:column;gap:6px}.dsh-sc-card{border:1px solid var(--dsw-alias-border-l1,#8883);border-left:3px solid var(--dsw-alias-state-business-primary,#4d7bea);border-radius:10px;background:var(--dsw-alias-bg-base,#fff);color:var(--dsw-alias-label-primary,#222);padding:9px 12px;font:13px/1.55 system-ui,sans-serif;min-width:0}.dsh-sc-card header{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary,#777)}.dsh-sc-card header span{flex:1}.dsh-sc-card button{border:0;background:transparent;color:inherit;cursor:pointer;border-radius:4px;padding:2px 6px}.dsh-sc-card button:hover{background:#81858d20}.dsh-sc-card button:disabled{opacity:.5;cursor:wait}.dsh-sc-card blockquote{margin:5px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;max-height:70px;overflow:hidden}.dsh-sc-card[data-expanded="true"] blockquote{max-height:none}.dsh-sc-card p{margin:4px 0 0;color:var(--dsw-alias-label-secondary,#777);font-size:12px}`;
       return () => { disposed = true; style.remove(); for (const off of senders.values()) off(); senders.clear(); };
+    });
+    ctx.effect(() => hideTemporarySessions(ctx.sessions.list));
+    ctx.effect(() => ctx.sidebarRight.registerCloseHandler('selectionchat', (_owner, tab) => queueClose(parseAddress(tab.contentId))));
+    ctx.effect(() => {
+      for (const id of cleanupQueue) void clean(id);
+      return () => { for (const timer of timers) clearTimeout(timer); timers.clear(); };
     });
 
     function SelectionDock({ sessionId, useInput }) {
@@ -256,9 +330,10 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
 
       useEffect(() => {
         const off = cards.subscribe(() => refresh(n => n + 1));
+        const listener = () => refresh(n => n + 1); metaListeners.add(listener);
         try { ensureSender(sessionId); } catch (e) { setNotice(e.message); }
         refresh(n => n + 1);
-        return off;
+        return () => { off(); metaListeners.delete(listener); };
       }, [sessionId]);
 
       const append = text => {
@@ -273,12 +348,14 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
       };
       const ask = async selection => {
         if (!current() || busyRef.current || selection.sessionId !== sessionId) return;
-        busyRef.current = true; setBusy(true); setNotice('正在准备侧边分支，不会自动发送消息…');
-        if (!selection.branch) selection.branch = createBranchOp(ctx.sessions, address => ctx.sidebarRight.openResource(address), remember);
+        busyRef.current = true; setBusy(true); setNotice('');
+        if (!selection.branch) selection.branch = createBranchOp(temporaryApi, address => ctx.sidebarRight.openResource(address), (info, text) => {
+          metadata.set(info.id, info); publishMeta(); remember(info.id, text);
+        });
         retry.current = selection;
         try {
           const child = await selection.branch({ sessionId, text: selection.text, isCurrent: current });
-          if (current()) { setPick(null); setNotice('侧边分支已准备，填写问题后手动发送。'); }
+          if (current()) { setPick(null); setNotice(''); }
           return child;
         } catch (e) {
           if (current()) setNotice('无法打开侧边聊天：' + e.message + '。可重试打开；如已创建分支将复用它。');
@@ -286,6 +363,8 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
       };
       const disabled = busy || ['adjudicating', 'submitting'].includes(input.phase);
       return h('div', { ref: anchor, 'data-selection-chat-dock': sessionId },
+        cleanupErrors.size > 0 && h('div', { className: 'dsh-sc-notice', role: 'alert' }, '临时侧边聊天清理失败：' + [...cleanupErrors.values()].join('；'),
+          h('button', { onClick: () => { for (const id of cleanupErrors.keys()) void clean(id); } }, '重试清理')),
         cards.list(sessionId).length > 0 && h('div', { className: 'dsh-sc-cards', 'aria-label': '待发送引用' },
           cards.list(sessionId).map(card => h('section', { key: card.id, className: 'dsh-sc-card', 'data-expanded': !!expanded[card.id] },
             h('header', null, h('span', null, card.state === 'sending' ? '引用 · 正在提交…' : '引用当前对话'),
@@ -313,12 +392,48 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     }
     function SideTab({ useResource, useTabInfo, SessionProvider, renderSlot }) {
       const { tab } = useTabInfo(), resource = useResource(tab.contentId);
-      return h('section', { className: 'dsh-sc-panel', 'aria-label': '划词侧边聊天' },
-        h('header', null, '独立分支 · 继承最近已完成的上下文。发送会消耗当前模型额度，请确认模型与权限。'),
+      const panel = useRef(null);
+      const [saving, setSaving] = useState(false), [error, setError] = useState('');
+      const id = resource.value?.id, meta = metadata.get(id) || resource.value?.meta;
+      const temporary = !!id?.startsWith(TEMP_PREFIX);
+      useEffect(() => {
+        const root = panel.current, hidden = new Set(meta?.hiddenTurns || []), owned = new Set();
+        if (!root || hidden.size === 0) return;
+        // 同步 hidden 属性，让宿主滚动/间距计算也排除继承行，而不只在视觉上覆盖。
+        const update = () => {
+          for (const row of root.querySelectorAll('[data-chat-turn]')) {
+            const raw = row.getAttribute('data-chat-turn'), hide = raw !== '' && hidden.has(Number(raw));
+            if (hide && !row.hidden) { row.hidden = true; owned.add(row); }
+            else if (!hide && owned.delete(row)) row.hidden = false;
+          }
+        };
+        const observer = new MutationObserver(update);
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-chat-turn', 'hidden'] });
+        update();
+        return () => { observer.disconnect(); for (const row of owned) row.hidden = false; };
+      }, [id, meta]);
+      const save = async () => {
+        if (saving || !id) return;
+        setSaving(true); setError('');
+        try {
+          if (cards.list(id).some(c => c.state === 'sending')) throw Error('请等待当前消息提交完成后保存。');
+          const info = await temporaryApi('save', { id });
+          metadata.set(id, info);
+          metadata.set(info.savedId, { ...info, id: info.savedId, state: 'saved' });
+          cards.move(id, info.savedId); publishMeta();
+          // 原生标签替换绑定原主会话，切换主会话期间也不会保存到错误的目录。
+          await tab.actions.openResource(resourceAddress(info.savedId), { replaceTab: true });
+        } catch (e) { setError(e.message); } finally { setSaving(false); }
+      };
+      return h('section', { ref: panel, className: 'dsh-sc-panel', 'aria-label': '划词侧边聊天', 'data-selection-chat-session': id },
+        h('style', null, inheritedHistoryCss(id || '', meta?.hiddenTurns || [])),
+        h('header', { style: { display: 'flex', alignItems: 'center', gap: 8 } }, h('span', null, temporary ? '临时聊天' : '已保存'),
+          temporary && h('button', { onClick: save, disabled: saving, style: { marginLeft: 'auto', cursor: 'pointer' } }, saving ? '正在保存…' : meta?.savedId ? '打开已保存会话' : '保存')),
+        error && h('div', { role: 'alert', className: 'dsh-sc-notice' }, error),
         resource.error && h('div', { role: 'alert', className: 'dsh-sc-notice' }, '侧边会话加载失败：' + (resource.error.message || String(resource.error))),
         h('div', null, resource.value ? h(SessionProvider, { session: resource.value.reference }, renderSlot(SLOT, {})) : h('p', null, '正在加载侧边会话…')));
     }
-    ctx.effect(() => ctx.resources.register(resourceProvider(ctx.sessions)));
+    ctx.effect(() => ctx.resources.register(resourceProvider(ctx.sessions, getMetadata)));
     ctx.effect(() => ctx.sidebarRightTabs.register({ id: ID, kind: 'selectionchat', patterns: [PREFIX + '**'], priority: 'extension', canOpen: address => !!parseAddress(address), title: address => '侧边聊天 · ' + (parseAddress(address)?.slice(-6) || '') }));
     bind('sidebar.right.pane.tab', { key: ID, children: { [SLOT]: { kind: 'single', scope: 'session' } } }, SideTab);
     bind(SLOT, {}, Conversation);
@@ -326,5 +441,6 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
   }
   return { apply, inject: ['slots', 'sessions', 'resources', 'conversation', 'uiSession', 'uiConversation', 'sidebarRight', 'sidebarRightTabs'],
     // 纯函数与生命周期边界导出供离线测试，不调用模型、不操作用户窗口。
-    quoteText, parseAddress, resourceAddress, toolbarPosition, readSelection, createQuoteStore, attachQuoteSender, resourceProvider, createBranchOp };
+    quoteText, parseAddress, resourceAddress, toolbarPosition, readSelection, createQuoteStore, attachQuoteSender, resourceProvider, createBranchOp,
+    hideTemporarySessions, inheritedHistoryCss };
 } });
