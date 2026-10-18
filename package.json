@@ -1,0 +1,23 @@
+{
+  "name": "@local/dsh-selection-chat",
+  "version": "1.1.1",
+  "private": true,
+  "type": "module",
+  "description": "DSH 对话划词引用与原生侧边分支聊天",
+  "homepage": "https://github.com/aadmin61-design/dsh-selection-chat#readme",
+  "repository": { "type": "git", "url": "https://github.com/aadmin61-design/dsh-selection-chat.git" },
+  "bugs": { "url": "https://github.com/aadmin61-design/dsh-selection-chat/issues" },
+  "exports": { ".": "./index.mjs", "./client": "./client.js", "./package.json": "./package.json" },
+  "files": ["index.mjs", "client.js", "cordis.patch.yml", "README.md", "CHANGELOG.md", "tests", "scripts"],
+  "scripts": { "test": "node --test tests/*.test.mjs", "check": "node --check client.js" },
+  "engines": { "node": ">=22" },
+  "peerDependencies": { "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.2" },
+  "peerDependenciesMeta": { "@deepseek-ai/dsh-api-session-controller": { "optional": true } },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-api-session-controller", "@deepseek-ai/dsh-client-resources", "@deepseek-ai/dsh-client-ui-chat", "@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-session", "@deepseek-ai/dsh-client-ui-sidebar-right"]
+    }
+  }
+}

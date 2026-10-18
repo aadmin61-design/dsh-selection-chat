@@ -1,0 +1,4 @@
+- insert:
+    - id: local-selection-chat
+      name: '@local/dsh-selection-chat'
+      config: {}

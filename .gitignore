@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.runtime/
+.inspect/
+.env
+.env.*
+*.log
+*.tgz
+*.zip
+.DS_Store
+Thumbs.db
