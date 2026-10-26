@@ -14,8 +14,16 @@ async function main() {
   const hostPackage = name => path.join(runtime, 'node_modules/@deepseek-ai', name);
   const readClient = name => fs.readFileSync(path.join(hostPackage(name), 'lib/client.js'), 'utf8');
   const version = JSON.parse(fs.readFileSync(path.join(hostPackage('dsh-api-session-controller'), 'package.json'))).version;
-  assert.equal(version, pkg.peerDependencies['@deepseek-ai/dsh-api-session-controller'], '请检查新宿主版本后再更新兼容声明');
-  for (const dependency of pkg.dsh.client.inject) assert.ok(fs.existsSync(path.join(runtime, 'node_modules', dependency, 'package.json')), '缺少宿主模块：' + dependency);
+  // 只接受逐一验证过的精确预发布版本，不能用宽泛范围放行未知宿主。
+  const supported = pkg.peerDependencies['@deepseek-ai/dsh-api-session-controller'].split(' || ');
+  assert.ok(supported.includes(version), '尚未验证的宿主版本：' + version);
+  const sessionVersion = JSON.parse(fs.readFileSync(path.join(hostPackage('dsh-session'), 'package.json'))).version;
+  assert.equal(sessionVersion, version, '宿主会话模块版本不一致');
+  for (const dependency of pkg.dsh.client.inject) {
+    const manifest = path.join(runtime, 'node_modules', dependency, 'package.json');
+    assert.ok(fs.existsSync(manifest), '缺少宿主模块：' + dependency);
+    assert.equal(JSON.parse(fs.readFileSync(manifest)).version, version, '宿主客户端模块版本混用：' + dependency);
+  }
   const conversation = readClient('dsh-client-ui-conversation');
   for (const contract of ['"conversation.input.dock"', '"data-conversation-content"', '"data-conversation-session"', 'captureInsertion:', 'insertText:', 'persistDraft:', '"conversation.content"']) assert.ok(conversation.includes(contract), '缺少输入/会话契约：' + contract);
   for (const contract of ['sinkSerialized(attempt, draft, mode)', 'settleDetachedFailure(attempt, message)', 'this.deps.defaultSink(out.trim(), attachmentIds, mode, attempt.signal)', 'for(actx)', 'this.shellFor(binding)']) assert.ok(conversation.includes(contract), '缺少引用发送适配契约：' + contract);
@@ -29,7 +37,7 @@ async function main() {
   vm.runInNewContext(fs.readFileSync(path.join(root, 'client.js'), 'utf8'), {
     window: { __ModuleLoader__: { load: definition => { client = definition.factory(() => ({})); } } }, URL
   });
-  for (const fail of [false, true]) {
+  for (const mode of ['queue', 'steer']) for (const fail of [false, true]) {
     const cards = client.createQuoteStore(), sent = [], waits = [];
     let release;
     const chip = new Promise((resolve, reject) => { release = () => fail ? reject(Error('chip failed')) : resolve('文件引用'); });
@@ -44,7 +52,7 @@ async function main() {
     const dispose = client.attachQuoteSender(shell, cards, 'session-test');
     cards.add('session-test', '划词引用');
     const attempt = { seq: 1, signal: new AbortController().signal };
-    shell.sinkSerialized(attempt, '@ 问题', 'steer');
+    shell.sinkSerialized(attempt, '@ 问题', mode);
     assert.equal(shell.detachedDrafts.get(1).draft, '@ 问题', '原生失败恢复记录不应含隐藏引用');
     cards.add('session-test', '下一条引用');
     release(); await new Promise(resolve => setImmediate(resolve)); await Promise.all(waits);
@@ -53,10 +61,41 @@ async function main() {
       assert.equal(cards.list('session-test')[0].state, 'ready');
     } else {
       assert.equal(sent[0][0], '文件引用 问题' + client.quoteText('划词引用'));
-      assert.equal(sent[0][1][0], 'file-id'); assert.equal(sent[0][2], 'steer'); assert.equal(sent[0][3], attempt.signal);
+      assert.equal(sent[0][1][0], 'file-id'); assert.equal(sent[0][2], mode); assert.equal(sent[0][3], attempt.signal);
       assert.equal(cards.list('session-test').length, 1); assert.equal(cards.list('session-test')[0].text, '下一条引用');
     }
     dispose();
+  }
+  // rc.3 新增 keep/append/replace 草稿策略；执行宿主原方法，验证引用适配不接管草稿恢复。
+  if (version === '0.2.1-rc.3') {
+    const draftStart = conversation.indexOf('requestDraftInitialization(options) {');
+    const draftEnd = conversation.indexOf('\n\t\t\tdraftInitializationBlocked()', draftStart);
+    assert.ok(draftStart >= 0 && draftEnd > draftStart);
+    const initialize = vm.runInNewContext('({' + conversation.slice(draftStart, draftEnd) + '}).requestDraftInitialization');
+    const cards = client.createQuoteStore();
+    let draft = '原问题', blocked = false;
+    const shell = { sinkSerialized: nativeSerialize, settleDetachedFailure() {}, deps: { defaultSink() {} },
+      attachmentIds: ['file-id'], snapshot: { draft }, requestDraftInitialization: initialize,
+      draftInitializationBlocked: () => blocked,
+      setDraft: text => { draft = text; shell.snapshot.draft = text; },
+      draftEditor: { appendDraft: text => { draft += '\n' + text; shell.snapshot.draft = draft; } } };
+    const off = client.attachQuoteSender(shell, cards, 'draft-session');
+    cards.add('draft-session', '选中的原文');
+    assert.equal(shell.requestDraftInitialization({}), 'preserved');
+    assert.equal(shell.requestDraftInitialization({ prompt: '新任务', whenDraftExists: 'keep' }), 'preserved');
+    assert.equal(draft, '原问题');
+    assert.equal(shell.requestDraftInitialization({ prompt: '补充', whenDraftExists: 'append' }), 'applied');
+    assert.equal(draft, '原问题\n补充');
+    blocked = true;
+    assert.equal(shell.requestDraftInitialization({ prompt: '不可覆盖', whenDraftExists: 'replace' }), 'blocked');
+    assert.equal(draft, '原问题\n补充');
+    blocked = false;
+    assert.equal(shell.requestDraftInitialization({ prompt: '主动替换', whenDraftExists: 'replace' }), 'applied');
+    assert.equal(draft, '主动替换');
+    assert.deepEqual(shell.attachmentIds, ['file-id']);
+    assert.equal(cards.list('draft-session')[0].text, '选中的原文');
+    assert.equal(cards.list('draft-session')[0].state, 'ready');
+    off(); assert.equal(shell.requestDraftInitialization, initialize);
   }
   const sessions = readClient('dsh-api-session-controller');
   for (const contract of ['async fork(opts)', 'retain(target, options)', 'allowMigration', 'workspaceAttachSessionId']) assert.ok(sessions.includes(contract), '缺少会话契约：' + contract);
@@ -115,7 +154,7 @@ async function main() {
     const fiber = await ctx.plugin(plugin);
     await fiber.dispose();
     console.log(JSON.stringify({ ok: true, plugin: pkg.name, version: pkg.version, dsh: version,
-      checks: ['真实 Cordis 加载及认证路由注册和卸载', '安装包中的客户端接口与声明检查', '真实宿主序列化方法：异步芯片、附件、steer、失败恢复及引用快照', '真实 AgentLoop 写句柄入口：临时跳过，保存恢复持久化；原生 fork seed'],
+      checks: ['真实 Cordis 加载及认证路由注册和卸载', '安装包中的客户端接口、版本一致性与声明检查', '真实宿主序列化方法：异步芯片、附件、queue/steer、失败恢复及引用快照', ...(version === '0.2.1-rc.3' ? ['rc.3 真实草稿初始化方法：keep/append/replace、阻塞期与附件/引用隔离'] : []), '真实 AgentLoop 写句柄入口：临时跳过，保存恢复持久化；原生 fork seed'],
       limits: ['未执行真实浏览器渲染', '未新建真实会话或发送消息；界面由用户手动验收'] }));
   } finally { await ctx.fiber.dispose(); }
 }

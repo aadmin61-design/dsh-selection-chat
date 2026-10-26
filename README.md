@@ -1,8 +1,8 @@
-# DSH Selection Chat 1.2.0
+# DSH Selection Chat 1.2.1
 
-独立的 DSH 划词引用与侧边聊天插件。只需要本机已有的 DSH **0.2.1-rc.2**，不依赖 Codex、不依赖 codex-dots，也不需要安装 Node/Python/前端环境。无需构建。
+独立的 DSH 划词引用与侧边聊天插件。只需要本机已有的 DSH **0.2.1-rc.3**（同时支持 **0.2.1-rc.2**），不依赖 Codex、不依赖 codex-dots，也不需要安装 Node/Python/前端环境。无需构建。
 
-[下载安装包](https://github.com/aadmin61-design/dsh-selection-chat/releases/download/v1.2.0/dsh-selection-chat-1.2.0.zip) · [版本发布与校验文件](https://github.com/aadmin61-design/dsh-selection-chat/releases) · [更新记录](CHANGELOG.md)
+[下载安装包](https://github.com/aadmin61-design/dsh-selection-chat/releases/download/v1.2.1/dsh-selection-chat-1.2.1.zip) · [版本发布与校验文件](https://github.com/aadmin61-design/dsh-selection-chat/releases) · [更新记录](CHANGELOG.md)
 
 ## 功能
 
@@ -33,16 +33,18 @@
 
 ## 安装与卸载
 
-1. 在 [Releases](https://github.com/aadmin61-design/dsh-selection-chat/releases/latest) 下载附件 `dsh-selection-chat-1.2.0.zip`，将其中的 `dsh-selection-chat` 文件夹解压到固定位置，例如 `C:\dsh-plugins\dsh-selection-chat`。请选择发行附件，安装更直接。
+1. 在 [Releases](https://github.com/aadmin61-design/dsh-selection-chat/releases/latest) 下载附件 `dsh-selection-chat-1.2.1.zip`，将其中的 `dsh-selection-chat` 文件夹解压到固定位置，例如 `C:\dsh-plugins\dsh-selection-chat`。请选择发行附件，安装更直接。
 2. 打开 DSH → 插件 → 添加插件，填写该文件夹的**绝对路径**，安装并启用。
 3. 若提示重启，先结束正在运行的任务，再手动重启 DSH。
-4. 详情应显示 `@local/dsh-selection-chat`、`v1.2.0` 和组件运行中。
+4. 详情应显示 `@local/dsh-selection-chat`、`v1.2.1` 和组件运行中。
 
 源码安装可直接使用包含 `package.json`、`index.mjs`、`temporary.mjs`、`client.js` 和 `cordis.patch.yml` 的完整目录。不需要 `npm install`；本地链接安装后请保留目录。
 
 如果通过 GitHub 的 **Code → Download ZIP** 下载源码，也可以解压后安装：填写实际包含 `package.json` 的文件夹路径，不要填写 ZIP 路径或它的上级目录。安装成功后，打开一个至少完成一轮的 DSH 对话，划选回答正文即可看到操作按钮。
 
 **升级到新版本**：先结束当前发送，解压新包覆盖原插件目录，然后重启 DSH。链接安装会继续使用原路径，请勿在升级后移动或删除该目录。
+
+**DSH rc.3 升级**：使用本插件 1.2.1；如果旧版插件因为依赖版本不匹配被停用，更新后在插件详情重新启用。结束或保存临时侧边聊天后再重启，未保存的临时内容会随 DSH 退出而丢弃。新版本保留输入框上方引用卡片，不向草稿提前插入引文。
 
 **从 1.0.0 升级**：先结束当前发送，解压新包覆盖原安装目录中的插件文件，然后手动重启 DSH。若使用源码目录链接安装，本目录已更新，重启加载即可。旧版已经写进输入框的引用属于普通草稿，请手动删掉这部分再重新划词；插件不会擅自识别或删除你的草稿。
 
@@ -56,6 +58,7 @@
 | --- | --- |
 | 打开一个至少完成一轮的普通 DSH 对话，选择回答中的一段文字 | 选区上方或下方出现两个按钮，样式跟随明暗主题 |
 | 先在输入框写“我的问题”，再划选正文并点击“添加到对话” | 输入框仍只有“我的问题”，上方出现引用卡片；没有发送消息，没有模型开始运行 |
+| 在 rc.3 中写好未发送的问题和引用，切换到另一个会话再返回 | 草稿由 DSH 恢复，引用仍在原会话上方；发送后问题和引用各出现一次 |
 | 点击引用卡片的 ×，再重新添加两段引用 | 只移除相应卡片，问题不变；两条引用分别显示 |
 | 点击“展开”，切换会话再返回，或刷新页面 | 可查看完整原文；引用保留在原会话，不串到其他会话 |
 | 划选多行、代码块中的文字 | 引用保留换行和文字；不把选中代码当作命令运行 |
@@ -91,9 +94,9 @@ $env:ELECTRON_RUN_AS_NODE = '1'
 Remove-Item Env:ELECTRON_RUN_AS_NODE
 ```
 
-离线测试覆盖引用完整性、卡片增删和存储、会话隔离、发送快照、附件与 queue/steer 透传、失败恢复、资源释放、分支去重和卸载恢复。宿主检查执行安装包中的真实序列化方法，并验证 Cordis 加载和接口契约，**不等同于界面已验收**；实际卡片位置、原生发送和侧边聊天渲染仍需上述手动测试。
+离线测试覆盖引用完整性、卡片增删和存储、会话隔离、发送快照、附件与 queue/steer 透传、失败恢复、资源释放、分支去重和卸载恢复。宿主检查执行安装包中的真实序列化方法、rc.3 草稿初始化策略，并验证 Cordis 加载、模块版本一致性和接口契约，**不等同于界面已验收**；实际卡片位置、原生发送和侧边聊天渲染仍需上述手动测试。
 
-兼容范围锁定 DSH 0.2.1-rc.2。插件对原生提交入口做可卸载适配；临时会话只绕过预登记 ID 的写句柄获取，保存时使用正常持久化入口；左侧列表排除临时 ID，侧栏按继承轮次边界隐藏旧历史。关闭使用原生标签关闭回调，资源卸载不会触发清理。不修改 DSH 安装文件、不拦截按键、不删除既有日志。DSH 更新后需重新运行宿主检查，不能仅凭版本号假定兼容。
+兼容范围为 DSH 0.2.1-rc.2 和 0.2.1-rc.3；仅放行已验证的这两个精确版本。插件对原生提交入口做可卸载适配；临时会话只绕过预登记 ID 的写句柄获取，保存时使用正常持久化入口；左侧列表排除临时 ID，侧栏按继承轮次边界隐藏旧历史。关闭使用原生标签关闭回调，资源卸载不会触发清理。不修改 DSH 安装文件、不拦截按键、不删除既有日志。DSH 更新后需重新运行宿主检查，不能仅凭版本号假定兼容。
 
 发行包不包含 DSH 的代码、账号、历史或私密日志。这是独立插件，可以单独安装、升级和卸载。
 

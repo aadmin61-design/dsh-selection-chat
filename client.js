@@ -131,7 +131,7 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     };
   }
 
-  // 0.2.1-rc.2 适配边界：在普通消息进入原生序列化时固定引用快照。
+  // 0.2.1-rc.2 / rc.3 适配边界：在普通消息进入原生序列化时固定引用快照。
   // 不拦截按键、不改编辑器草稿；保留附件、引用芯片、queue/steer 和宿主失败恢复。
   function attachQuoteSender(shell, store, sessionId) {
     if (typeof shell?.sinkSerialized !== 'function' || typeof shell?.settleDetachedFailure !== 'function' || typeof shell?.deps?.defaultSink !== 'function') throw Error('当前 DSH 的发送接口不兼容，请更新插件；引用未写入输入框。');
