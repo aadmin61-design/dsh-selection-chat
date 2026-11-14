@@ -5,6 +5,24 @@ const assert = require('node:assert/strict');
 const { registerHooks } = require('node:module');
 const { pathToFileURL } = require('node:url');
 const vm = require('node:vm');
+const { parse } = require('internal/deps/acorn/acorn/dist/acorn');
+
+// 使用 Electron 自带解析器读取真实方法，兼容压缩包，不再依赖空格、引号和换行。
+function sourceParts(source) {
+  const methods = new Map(), functions = new Map(), constants = new Map();
+  const walk = node => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'MethodDefinition' && !methods.has(node.key.name)) methods.set(node.key.name, source.slice(node.start, node.end));
+    if (node.type === 'FunctionDeclaration') functions.set(node.id.name, source.slice(node.start, node.end));
+    if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier') constants.set(node.id.name, 'const ' + source.slice(node.start, node.end) + ';');
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === 'object') walk(value);
+    }
+  };
+  walk(parse(source, { ecmaVersion: 'latest', sourceType: 'script' }));
+  return { methods, functions, constants };
+}
 
 async function main() {
   const runtime = process.argv[2];
@@ -25,14 +43,12 @@ async function main() {
     assert.equal(JSON.parse(fs.readFileSync(manifest)).version, version, '宿主客户端模块版本混用：' + dependency);
   }
   const conversation = readClient('dsh-client-ui-conversation');
-  for (const contract of ['"conversation.input.dock"', '"data-conversation-content"', '"data-conversation-session"', 'captureInsertion:', 'insertText:', 'persistDraft:', '"conversation.content"']) assert.ok(conversation.includes(contract), '缺少输入/会话契约：' + contract);
-  for (const contract of ['sinkSerialized(attempt, draft, mode)', 'settleDetachedFailure(attempt, message)', 'this.deps.defaultSink(out.trim(), attachmentIds, mode, attempt.signal)', 'for(actx)', 'this.shellFor(binding)']) assert.ok(conversation.includes(contract), '缺少引用发送适配契约：' + contract);
+  for (const contract of ['conversation.input.dock', 'data-conversation-content', 'data-conversation-session', 'captureInsertion:', 'insertText:', 'persistDraft:', 'conversation.content']) assert.ok(conversation.includes(contract), '缺少输入/会话契约：' + contract);
+  const parts = sourceParts(conversation), modern = parts.methods.has('failSink');
+  for (const name of ['sinkSerialized', modern ? 'failSink' : 'settleDetachedFailure', 'shellFor', 'for']) assert.ok(parts.methods.has(name), '缺少发送方法：' + name);
   // 使用安装包中的真实序列化方法执行轻量契约测试，不启动浏览器或模型。
-  const start = conversation.indexOf('sinkSerialized(attempt, draft, mode) {');
-  const end = conversation.indexOf('\n\t\t\tnotifySubmission(submission)', start);
-  assert.ok(start >= 0 && end > start);
-  const method = conversation.slice(start, end);
-  const nativeSerialize = vm.runInNewContext('({' + method + '}).sinkSerialized');
+  const helpers = modern ? ['snapshotDraft', 'copyReference', 'serializeDraftPrompt', 'pushText', 'normalizeQuoteBoundaries'].map(name => parts.functions.get(name)).join('\n') + '\n' + parts.constants.get('QUOTE_SEPARATOR') : '';
+  const nativeSerialize = vm.runInNewContext(helpers + '\n({' + parts.methods.get('sinkSerialized') + '}).sinkSerialized');
   let client;
   vm.runInNewContext(fs.readFileSync(path.join(root, 'client.js'), 'utf8'), {
     window: { __ModuleLoader__: { load: definition => { client = definition.factory(() => ({})); } } }, URL
@@ -43,7 +59,7 @@ async function main() {
     const chip = new Promise((resolve, reject) => { release = () => fail ? reject(Error('chip failed')) : resolve('文件引用'); });
     const shell = {
       sinkSerialized: nativeSerialize,
-      settleDetachedFailure() {}, notifySubmission() {}, dead: () => false,
+      settleDetachedFailure() {}, ...(modern ? { failSink() {}, acceptSink() {} } : {}), notifySubmission() {}, dead: () => false,
       attachmentIds: ['file-id'], projection: { occurrences: [{ source: 'file', ref: {}, offset: 0, length: 1 }] },
       detachedDrafts: new Map(), failedDetached: new Map(), rev: 1,
       deps: { inputTriggers: () => ({ serializeReference: () => chip }), defaultSink: async (...args) => { sent.push(args); return { kind: 'success' }; } },
@@ -51,9 +67,9 @@ async function main() {
     };
     const dispose = client.attachQuoteSender(shell, cards, 'session-test');
     cards.add('session-test', '划词引用');
-    const attempt = { seq: 1, signal: new AbortController().signal };
+    const attempt = { seq: 1, signal: new AbortController().signal, occurrences: shell.projection.occurrences, quotes: [], attachmentIds: shell.attachmentIds };
     shell.sinkSerialized(attempt, '@ 问题', mode);
-    assert.equal(shell.detachedDrafts.get(1).draft, '@ 问题', '原生失败恢复记录不应含隐藏引用');
+    if (!modern) assert.equal(shell.detachedDrafts.get(1).draft, '@ 问题', '原生失败恢复记录不应含隐藏引用');
     cards.add('session-test', '下一条引用');
     release(); await new Promise(resolve => setImmediate(resolve)); await Promise.all(waits);
     if (fail) {
@@ -67,11 +83,8 @@ async function main() {
     dispose();
   }
   // rc.3 新增 keep/append/replace 草稿策略；执行宿主原方法，验证引用适配不接管草稿恢复。
-  if (version === '0.2.1-rc.3') {
-    const draftStart = conversation.indexOf('requestDraftInitialization(options) {');
-    const draftEnd = conversation.indexOf('\n\t\t\tdraftInitializationBlocked()', draftStart);
-    assert.ok(draftStart >= 0 && draftEnd > draftStart);
-    const initialize = vm.runInNewContext('({' + conversation.slice(draftStart, draftEnd) + '}).requestDraftInitialization');
+  if (version !== '0.2.1-rc.2') {
+    const initialize = vm.runInNewContext('({' + parts.methods.get('requestDraftInitialization') + '}).requestDraftInitialization');
     const cards = client.createQuoteStore();
     let draft = '原问题', blocked = false;
     const shell = { sinkSerialized: nativeSerialize, settleDetachedFailure() {}, deps: { defaultSink() {} },
@@ -98,13 +111,13 @@ async function main() {
     off(); assert.equal(shell.requestDraftInitialization, initialize);
   }
   const sessions = readClient('dsh-api-session-controller');
-  for (const contract of ['async fork(opts)', 'retain(target, options)', 'allowMigration', 'workspaceAttachSessionId']) assert.ok(sessions.includes(contract), '缺少会话契约：' + contract);
+  for (const contract of ['fork(opts)', 'retain(target', 'allowMigration', 'workspaceAttachSessionId']) assert.ok(sessions.includes(contract), '缺少会话契约：' + contract);
   const sidebar = readClient('dsh-client-ui-sidebar-right');
-  assert.ok(sidebar.includes('"sidebar.right.pane.tab"'));
-  assert.ok(sidebar.includes('registerCloseHandler(kind, handler)'));
-  assert.ok(sidebar.includes('this.closeHandlers.get(tab.kind)?.(sessionId, tab)'));
+  assert.ok(sidebar.includes('sidebar.right.pane.tab'));
+  assert.ok(sourceParts(sidebar).methods.has('registerCloseHandler'));
+  assert.match(sidebar, /this\.closeHandlers\.get\(tab\.kind\)\?\.\(sessionId,\s*tab\)/);
   const renderer = readClient('dsh-client-ui-renderer');
-  assert.ok(renderer.includes('kit["SessionProvider"]'));
+  assert.ok(renderer.includes('SessionProvider'));
   assert.ok(readClient('dsh-client-ui-chat').includes('"data-chat-flow-kind"'));
   const hooks = registerHooks({ resolve(name, context, next) {
     return next(name, name.startsWith('@deepseek-ai/') ? { ...context, parentURL: pathToFileURL(path.join(runtime, 'package.json')).href } : context);
@@ -154,7 +167,7 @@ async function main() {
     const fiber = await ctx.plugin(plugin);
     await fiber.dispose();
     console.log(JSON.stringify({ ok: true, plugin: pkg.name, version: pkg.version, dsh: version,
-      checks: ['真实 Cordis 加载及认证路由注册和卸载', '安装包中的客户端接口、版本一致性与声明检查', '真实宿主序列化方法：异步芯片、附件、queue/steer、失败恢复及引用快照', ...(version === '0.2.1-rc.3' ? ['rc.3 真实草稿初始化方法：keep/append/replace、阻塞期与附件/引用隔离'] : []), '真实 AgentLoop 写句柄入口：临时跳过，保存恢复持久化；原生 fork seed'],
+      checks: ['真实 Cordis 加载及认证路由注册和卸载', '压缩/非压缩客户端接口与声明检查', '真实宿主序列化方法：异步芯片、附件、queue/steer、失败恢复及引用快照', ...(version !== '0.2.1-rc.2' ? ['真实草稿初始化方法：keep/append/replace、阻塞期与附件/引用隔离'] : []), '真实 AgentLoop 写句柄入口：临时跳过，保存恢复持久化；原生 fork seed'],
       limits: ['未执行真实浏览器渲染', '未新建真实会话或发送消息；界面由用户手动验收'] }));
   } finally { await ctx.fiber.dispose(); }
 }

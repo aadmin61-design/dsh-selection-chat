@@ -131,10 +131,11 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     };
   }
 
-  // 0.2.1-rc.2 / rc.3 适配边界：在普通消息进入原生序列化时固定引用快照。
+  // 新旧宿主均在原生序列化前固定引用快照；0.2.2 使用 failSink 和消息接纳回调。
   // 不拦截按键、不改编辑器草稿；保留附件、引用芯片、queue/steer 和宿主失败恢复。
   function attachQuoteSender(shell, store, sessionId) {
-    if (typeof shell?.sinkSerialized !== 'function' || typeof shell?.settleDetachedFailure !== 'function' || typeof shell?.deps?.defaultSink !== 'function') throw Error('当前 DSH 的发送接口不兼容，请更新插件；引用未写入输入框。');
+    const failureKey = typeof shell?.failSink === 'function' ? 'failSink' : 'settleDetachedFailure';
+    if (typeof shell?.sinkSerialized !== 'function' || typeof shell?.[failureKey] !== 'function' || typeof shell?.deps?.defaultSink !== 'function') throw Error('当前 DSH 的发送接口不兼容，请更新插件；引用未写入输入框。');
     const flights = new Map(), patches = [];
     let active = true;
     const patch = (target, key, wrapped) => {
@@ -152,26 +153,35 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
       if (batch) { flights.delete(signal); store.finish(sessionId, batch, ok); }
       cleanup();
     };
-    const serialized = shell.sinkSerialized, failure = shell.settleDetachedFailure, sink = shell.deps.defaultSink;
+    const serialized = shell.sinkSerialized, failure = shell[failureKey], sink = shell.deps.defaultSink;
     patch(shell, 'sinkSerialized', function(attempt, ...args) {
       begin(attempt.signal);
       try { return serialized.call(this, attempt, ...args); }
       catch (error) { finish(attempt.signal, false); throw error; }
     });
-    patch(shell, 'settleDetachedFailure', function(attempt, ...args) {
+    patch(shell, failureKey, function(attempt, ...args) {
       finish(attempt.signal, false);
       return failure.call(this, attempt, ...args);
     });
-    patch(shell.deps, 'defaultSink', async function(text, attachments, mode, signal) {
+    patch(shell.deps, 'defaultSink', async function(text, attachments, mode, signal, accept, ...rest) {
       // 仅附件提交跳过 sinkSerialized，因此在这里同步领取其引用快照。
       const batch = begin(signal);
       try {
         const outgoing = text + batch.map(c => quoteText(c.text)).join('');
-        const result = await sink.call(this, outgoing, attachments, mode, signal);
+        // 接纳回调先于最终应答时即消费引用，避免后续网络错误恢复已经发送过的内容。
+        const onAccept = typeof accept === 'function' ? (...args) => { finish(signal, true); return accept(...args); } : accept;
+        const result = await sink.call(this, outgoing, attachments, mode, signal, onAccept, ...rest);
         finish(signal, result?.kind === 'success');
         return result;
       } catch (error) { finish(signal, false); throw error; }
     });
+    if (failureKey === 'failSink' && typeof shell.settleSink === 'function') {
+      const settle = shell.settleSink;
+      patch(shell, 'settleSink', function(attempt, pending) {
+        // 宿主过滤空引用后可能直接完成而不调用 defaultSink；此时保留尚未发送的卡片。
+        return settle.call(this, attempt, Promise.resolve(pending).then(result => { finish(attempt.signal, false); return result; }));
+      });
+    }
     // 卸载后不领取新引用，已获授权的在途发送仍完成原生生命周期。
     return () => { active = false; cleanup(); };
   }

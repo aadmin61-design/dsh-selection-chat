@@ -61,6 +61,49 @@ function senderFixture(sink = async () => ({ kind: 'success' })) {
   return { store, shell, calls, dispose, original };
 }
 
+// 0.2.2 在最终结果前通知消息已接纳；测试这个顺序，避免引用被重复恢复。
+test('新版接纳回调保留原生草稿生命周期，接纳后的网络错误不恢复已发送引用', async () => {
+  const store = p.createQuoteStore(), calls = [];
+  const shell = { sinkSerialized() {}, failSink() {}, settleSink: (_attempt, pending) => pending,
+    deps: { defaultSink: async (...args) => { calls.push(args); args[4]('accepted'); throw Error('接纳后断网'); } } };
+  const original = shell.deps.defaultSink, originalFailure = shell.failSink;
+  const off = p.attachQuoteSender(shell, store, 'new-host');
+  const attempt = { signal: new AbortController().signal };
+  store.add('new-host', '原文'); shell.sinkSerialized(attempt, '问题', 'queue');
+  let accepted;
+  await assert.rejects(shell.deps.defaultSink('问题', ['image'], 'queue', attempt.signal, value => { accepted = value; }), /接纳后断网/);
+  assert.equal(accepted, 'accepted'); assert.equal(calls[0][0], '问题' + p.quoteText('原文'));
+  assert.equal(calls[0][1][0], 'image'); assert.equal(calls[0][3], attempt.signal);
+  shell.failSink(attempt, Error('延迟错误')); assert.equal(store.list('new-host').length, 0);
+  off(); assert.equal(shell.deps.defaultSink, original); assert.equal(shell.failSink, originalFailure);
+});
+
+test('新版序列化失败和直接跳过发送均保留引用，供用户重试', async () => {
+  const store = p.createQuoteStore(); let failed;
+  const shell = { sinkSerialized() {}, failSink: (_a, error) => { failed = error; },
+    settleSink: (_a, pending) => pending, deps: { defaultSink: async () => ({ kind: 'success' }) } };
+  const off = p.attachQuoteSender(shell, store, 'new-host');
+  const attempt = { signal: new AbortController().signal };
+  store.add('new-host', '原文'); shell.sinkSerialized(attempt, '问题', 'steer');
+  shell.failSink(attempt, Error('引用芯片失败'));
+  assert.equal(failed.message, '引用芯片失败'); assert.equal(store.list('new-host')[0].state, 'ready');
+  shell.sinkSerialized(attempt, '被宿主过滤的空芯片', 'queue');
+  await shell.settleSink(attempt, Promise.resolve({ kind: 'success' }));
+  assert.equal(store.list('new-host')[0].state, 'ready'); off();
+});
+
+test('新版普通发送成功只消费当前快照，保留发送期间新加的引用', async () => {
+  const store = p.createQuoteStore(); let release, text;
+  const shell = { sinkSerialized() {}, failSink() {}, settleSink: (_a, promise) => promise,
+    deps: { defaultSink: value => { text = value; return new Promise(resolve => { release = resolve; }); } } };
+  const off = p.attachQuoteSender(shell, store, 'new-host'), attempt = { signal: new AbortController().signal };
+  store.add('new-host', '第一条'); shell.sinkSerialized(attempt, '问题', 'steer');
+  const done = shell.settleSink(attempt, shell.deps.defaultSink('问题', [], 'steer', attempt.signal));
+  store.add('new-host', '下一条'); release({ kind: 'success' }); await done;
+  assert.equal(text, '问题' + p.quoteText('第一条')); assert.equal(store.list('new-host').length, 1);
+  assert.equal(store.list('new-host')[0].text, '下一条'); off();
+});
+
 test('普通发送附加卡片一次，原草稿、附件和 queue/steer 参数保持不变', async () => {
   let received;
   const f = senderFixture(async (...args) => { received = args; return { kind: 'success' }; });
