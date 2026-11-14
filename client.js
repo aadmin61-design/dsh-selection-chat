@@ -1,11 +1,9 @@
 // 无构建客户端模块：复用宿主 React、草稿编辑器、会话分支及侧栏。
 window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require => {
   const React = require('react');
-  const { createPortal } = require('react-dom');
   const { createElement: h, useState, useRef, useEffect } = React;
   const ID = '@local/dsh-selection-chat', SLOT = 'selection-chat.conversation';
   const PREFIX = 'dsh-resource://selectionchat/session/';
-  const MAX_QUOTE = 100000;
   const TEMP_PREFIX = 'selectionchat-temp-';
   async function temporaryApi(operation, input) {
     const transport = globalThis.__DSH_TRANSPORT__;
@@ -37,11 +35,6 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     return selectors.join(',') + '{display:none!important}';
   }
 
-  function quoteText(text) {
-    if (typeof text !== 'string' || !text.trim()) throw Error('请先选中一段对话正文。');
-    if (text.length > MAX_QUOTE) throw Error('选中内容超过 100000 字符，请缩小范围；未截断或发送内容。');
-    return '\n\n引用当前对话中的内容（作为讨论材料）：\n' + text.replace(/\r\n?/g, '\n').split('\n').map(line => '> ' + line).join('\n') + '\n\n';
-  }
   function resourceAddress(id) { return PREFIX + encodeURIComponent(id); }
   function parseAddress(address) {
     try {
@@ -52,139 +45,84 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
       return id;
     } catch { return; }
   }
-  function toolbarPosition(rect, width, height) {
-    const boxWidth = Math.min(300, Math.max(0, width - 16));
-    return { left: Math.max(8, Math.min(rect.left, width - boxWidth - 8)), top: Math.max(8, Math.min(rect.top >= 48 ? rect.top - 42 : rect.bottom + 8, height - 48)), maxWidth: boxWidth };
+  // 引用的编辑、预览、撤销和发送都交给 DSH；本插件不再包装发送方法。
+  function insertNativeQuote(actions, text) {
+    if (typeof text !== 'string' || !text.trim()) return false;
+    return actions.insertQuote(text);
   }
-  const elementOf = node => node?.nodeType === 1 ? node : node?.parentElement;
-  function readSelection(selection, root) {
-    if (!root?.isConnected || !selection || selection.isCollapsed || selection.rangeCount !== 1) return;
-    const range = selection.getRangeAt(0), start = elementOf(range.startContainer), end = elementOf(range.endContainer);
-    // 每个输入栏只处理自身 Conversation 内的正文，禁止跨会话、输入框或菜单取词。
-    const excluded = 'input,textarea,button,select,[contenteditable="true"],[role="textbox"],[data-conversation-region="composer"],[data-selection-chat-toolbar]';
-    if (!start || !end || start.closest(excluded) || end.closest(excluded)) return;
-    if (start.closest('[data-conversation-content]') !== root || end.closest('[data-conversation-content]') !== root) return;
-    if (!start.closest('[data-chat-flow-kind],[data-chat-group-key]') || !end.closest('[data-chat-flow-kind],[data-chat-group-key]')) return;
-    const text = selection.toString();
-    if (!text.trim()) return;
-    const rect = range.getBoundingClientRect();
-    if (!rect.width && !rect.height) return;
-    return { text, rect };
+  function canQuote(session) {
+    return !session.removed && (session.subagent === null || session.subagent?.address.mode === 'continuable');
   }
-  function createQuoteStore(storage) {
-    const key = 'dsh-selection-chat.cards.v2', rows = new Map(), listeners = new Set();
-    let serial = 0;
-    const valid = (id, text) => typeof id === 'string' && parseAddress(resourceAddress(id)) === id && typeof text === 'string' && text.trim() && text.length <= MAX_QUOTE;
+  function hasUnsentDraft(shell) {
+    const draft = shell?.draftSnapshot;
+    return !!(shell?.draftInitializationBlocked?.() || draft?.text?.trim() || draft?.quotes?.length || draft?.references?.length || shell?.attachmentIds?.length);
+  }
+  // 只缓存尚未交给原生编辑器的侧栏引用。旧版卡片由用户显式恢复，避免误重发。
+  function createPendingQuotes(storage) {
+    const key = 'dsh-selection-chat.native-pending.v1', rows = new Map(), listeners = new Set();
     try {
-      const saved = storage?.getItem(key);
-      if (saved) {
-        for (const [id, cards] of JSON.parse(saved)) {
-          if (!Array.isArray(cards)) continue;
-          const accepted = cards.filter(c => valid(id, c?.text)).map(c => ({ ...c, id: ++serial, state: c.state === 'sending' ? 'uncertain' : c.state === 'uncertain' ? 'uncertain' : 'ready' }));
-          if (accepted.length) rows.set(id, accepted);
-        }
-      } else {
-        for (const [id, text] of JSON.parse(storage?.getItem('dsh-selection-chat.pending.v1') || '[]')) {
-          if (valid(id, text)) rows.set(id, [{ id: ++serial, text, state: 'ready' }]);
-        }
+      for (const [id, entries] of JSON.parse(storage?.getItem(key) || '[]')) rows.set(id, entries);
+      for (const [id, entries] of JSON.parse(storage?.getItem('dsh-selection-chat.cards.v2') || '[]')) {
+        const current = rows.get(id) || [];
+        for (const entry of entries) if (!current.some(c => c.text === entry.text)) current.push({ text: entry.text, legacy: true, uncertain: entry.state !== 'ready' });
+        if (current.length) rows.set(id, current);
       }
-    } catch { /* 损坏的本地缓存不会阻止宿主输入框加载。 */ }
+      for (const [id, text] of JSON.parse(storage?.getItem('dsh-selection-chat.pending.v1') || '[]')) {
+        const current = rows.get(id) || [];
+        if (!current.some(c => c.text === text)) current.push({ text, legacy: true });
+        rows.set(id, current);
+      }
+      // 迁移成功落盘后才移除旧缓存；无存储权限时仍能在当前窗口使用。
+      storage?.setItem(key, JSON.stringify([...rows]));
+      storage?.removeItem('dsh-selection-chat.cards.v2'); storage?.removeItem('dsh-selection-chat.pending.v1');
+    } catch { /* 存储受限时继续使用当前窗口内存。 */ }
     const publish = () => {
-      try { storage?.setItem(key, JSON.stringify([...rows])); } catch { /* 存储受限时仍保留当前窗口内的卡片。 */ }
+      try { storage?.setItem(key, JSON.stringify([...rows])); } catch {}
       for (const listener of listeners) listener();
     };
-    publish();
     return {
       list: id => rows.get(id) || [],
-      subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
-      add(id, text) {
-        quoteText(text);
-        if (!valid(id, text)) throw Error('引用缺少有效的会话标识。');
-        const cards = rows.get(id) || [];
-        if (cards.some(c => c.text === text && c.state === 'ready')) return;
-        if (cards.reduce((n, c) => n + c.text.length, text.length) > MAX_QUOTE) throw Error('本会话待发送引用总计超过 100000 字符，请先移除部分引用。');
-        rows.set(id, [...cards, { id: ++serial, text, state: 'ready' }]); publish();
-      },
-      remove(id, cardId) {
-        const cards = (rows.get(id) || []).filter(c => c.id !== cardId || c.state === 'sending');
-        if (cards.length) rows.set(id, cards); else rows.delete(id);
-        publish();
-      },
+      subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      add(id, text) { if (!text?.trim()) return; const current = rows.get(id) || []; rows.set(id, [...current, { text }]); publish(); },
       clear(id) { rows.delete(id); publish(); },
-      move(from, to) {
-        rows.set(to, [...(rows.get(to) || []), ...(rows.get(from) || [])]); rows.delete(from); publish();
-      },
-      reuse(id, cardId) {
-        rows.set(id, (rows.get(id) || []).map(c => c.id === cardId && c.state === 'uncertain' ? { ...c, state: 'ready', error: undefined } : c)); publish();
-      },
-      take(id) {
-        const cards = rows.get(id) || [], batch = cards.filter(c => c.state === 'ready');
-        if (batch.length) { rows.set(id, cards.map(c => batch.includes(c) ? { ...c, state: 'sending', error: undefined } : c)); publish(); }
-        return batch;
-      },
-      finish(id, batch, ok) {
-        const ids = new Set(batch.map(c => c.id));
-        const cards = (rows.get(id) || []).flatMap(c => !ids.has(c.id) ? [c] : ok ? [] : [{ ...c, state: 'ready', error: '发送失败，引用已恢复。请检查原问题后重试。' }]);
-        if (cards.length) rows.set(id, cards); else rows.delete(id);
-        if (batch.length) publish();
+      deliver(id, actions, legacy = false) {
+        let changed = false;
+        // 逐条接纳，宿主暂时拒绝时留下原条目，待编辑器就绪后再处理。
+        const remaining = [];
+        for (const entry of rows.get(id) || []) {
+          if (!!entry.legacy === legacy && insertNativeQuote(actions, entry.text)) changed = true;
+          else remaining.push(entry);
+        }
+        if (remaining.length) rows.set(id, remaining); else rows.delete(id);
+        if (changed) publish();
+        return !remaining.some(entry => !!entry.legacy === legacy);
       }
     };
   }
-
-  // 新旧宿主均在原生序列化前固定引用快照；0.2.2 使用 failSink 和消息接纳回调。
-  // 不拦截按键、不改编辑器草稿；保留附件、引用芯片、queue/steer 和宿主失败恢复。
-  function attachQuoteSender(shell, store, sessionId) {
-    const failureKey = typeof shell?.failSink === 'function' ? 'failSink' : 'settleDetachedFailure';
-    if (typeof shell?.sinkSerialized !== 'function' || typeof shell?.[failureKey] !== 'function' || typeof shell?.deps?.defaultSink !== 'function') throw Error('当前 DSH 的发送接口不兼容，请更新插件；引用未写入输入框。');
-    const flights = new Map(), patches = [];
-    let active = true;
-    const patch = (target, key, wrapped) => {
-      const descriptor = Object.getOwnPropertyDescriptor(target, key);
-      Object.defineProperty(target, key, { configurable: true, writable: true, value: wrapped });
-      patches.push(() => {
-        if (Object.getOwnPropertyDescriptor(target, key)?.value !== wrapped) return;
-        if (descriptor) Object.defineProperty(target, key, descriptor); else delete target[key];
-      });
-    };
-    const cleanup = () => { if (!active && flights.size === 0) patches.splice(0).reverse().forEach(off => off()); };
-    const begin = signal => { if (!flights.has(signal)) flights.set(signal, active ? store.take(sessionId) : []); return flights.get(signal); };
-    const finish = (signal, ok) => {
-      const batch = flights.get(signal);
-      if (batch) { flights.delete(signal); store.finish(sessionId, batch, ok); }
-      cleanup();
-    };
-    const serialized = shell.sinkSerialized, failure = shell[failureKey], sink = shell.deps.defaultSink;
-    patch(shell, 'sinkSerialized', function(attempt, ...args) {
-      begin(attempt.signal);
-      try { return serialized.call(this, attempt, ...args); }
-      catch (error) { finish(attempt.signal, false); throw error; }
-    });
-    patch(shell, failureKey, function(attempt, ...args) {
-      finish(attempt.signal, false);
-      return failure.call(this, attempt, ...args);
-    });
-    patch(shell.deps, 'defaultSink', async function(text, attachments, mode, signal, accept, ...rest) {
-      // 仅附件提交跳过 sinkSerialized，因此在这里同步领取其引用快照。
-      const batch = begin(signal);
-      try {
-        const outgoing = text + batch.map(c => quoteText(c.text)).join('');
-        // 接纳回调先于最终应答时即消费引用，避免后续网络错误恢复已经发送过的内容。
-        const onAccept = typeof accept === 'function' ? (...args) => { finish(signal, true); return accept(...args); } : accept;
-        const result = await sink.call(this, outgoing, attachments, mode, signal, onAccept, ...rest);
-        finish(signal, result?.kind === 'success');
-        return result;
-      } catch (error) { finish(signal, false); throw error; }
-    });
-    if (failureKey === 'failSink' && typeof shell.settleSink === 'function') {
-      const settle = shell.settleSink;
-      patch(shell, 'settleSink', function(attempt, pending) {
-        // 宿主过滤空引用后可能直接完成而不调用 defaultSink；此时保留尚未发送的卡片。
-        return settle.call(this, attempt, Promise.resolve(pending).then(result => { finish(attempt.signal, false); return result; }));
-      });
-    }
-    // 卸载后不领取新引用，已获授权的在途发送仍完成原生生命周期。
-    return () => { active = false; cleanup(); };
+  function Icon({ kind = 'chat' }) {
+    const paths = { chat: 'M4 4h16v12H9l-5 4V4Z M8 8h8 M8 12h5', save: 'M12 3v12 M8 11l4 4 4-4 M5 16v4h14v-4', check: 'm5 12 4 4L19 6' };
+    return h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true }, h('path', { d: paths[kind] }));
   }
+  const CSS = `
+    .dsh-sc-actions{display:inline-flex;align-items:center;gap:2px;padding:3px;border-radius:999px;background:var(--dsw-alias-button-floating-fill);color:var(--dsw-alias-label-primary);box-shadow:var(--dsw-elevation-panel);--dsw-elevation-stroke-color:var(--dsw-alias-border-l3);font:var(--dsw-font-xs-13)}
+    .dsh-sc-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer;border-radius:6px;padding:5px 8px;white-space:nowrap}
+    .dsh-sc-actions .dsh-sc-button{border-radius:999px;padding:5px 10px}
+    .dsh-sc-button:hover,.dsh-sc-button:focus-visible{background:var(--dsw-alias-button-floating-hover)}
+    .dsh-sc-button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}
+    .dsh-sc-button:disabled{opacity:.45;cursor:default}
+    .dsh-sc-separator{width:1px;height:14px;background:var(--dsw-alias-border-l3)}
+    .dsh-sc-panel{display:flex;flex-direction:column;flex:1;min-height:0;height:100%;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
+    .dsh-sc-header{display:flex;align-items:center;gap:8px;min-height:40px;padding:0 12px;border-bottom:1px solid var(--dsw-alias-border-l3);font:var(--dsw-font-xs-13)}
+    .dsh-sc-title{font-weight:500}.dsh-sc-state{color:var(--dsw-alias-label-secondary);font-size:12px}.dsh-sc-save{margin-left:auto}
+    .dsh-sc-content,.dsh-sc-panel [data-slot="selection-chat.conversation"]{display:flex;flex-direction:column;flex:1;min-height:0}
+    .dsh-sc-notice,.dsh-sc-recover{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:6px 10px;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xs-13);overflow-wrap:anywhere}
+    .dsh-sc-notice [role="alert"]{flex:1;min-width:120px;color:var(--dsw-alias-state-error-primary)}
+    .dsh-sc-loading{display:flex;align-items:center;justify-content:center;flex:1;gap:8px;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xs-13)}
+    .dsh-sc-spinner{display:inline-block;width:12px;height:12px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:dsh-sc-spin .8s linear infinite}
+    @keyframes dsh-sc-spin{to{transform:rotate(360deg)}}
+    @media(prefers-reduced-motion:reduce){.dsh-sc-spinner{animation:none}}
+  `;
+
   function resourceProvider(sessions, metadata = async () => undefined) {
     return { protocol: 'selectionchat', async *open(address, { signal }) {
       const id = parseAddress(address);
@@ -205,7 +143,7 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     return source => {
       if (task) return task;
       task = (async () => {
-        quoteText(source.text);
+        if (!source.text?.trim()) throw Error('请先选中一段正文。');
         if (!child) {
           requestId ||= mint();
           child = await api('create', { sourceId: source.sessionId, requestId });
@@ -223,193 +161,123 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
 
   function apply(ctx) {
     let storage;
-    try { storage = sessionStorage; } catch { /* 隐私模式允许内存工作。 */ }
-    const cards = createQuoteStore(storage), senders = new Map();
-    const metadata = new Map(), metaListeners = new Set(), cleanupQueue = new Set(), cleanupErrors = new Map(), closing = new Set();
-    const timers = new Set();
+    try { storage = sessionStorage; } catch {}
+    const quotes = createPendingQuotes(storage), metadata = new Map(), listeners = new Set();
+    const cleanupQueue = new Set(), cleanupErrors = new Map(), closing = new Set(), timers = new Set();
     let disposed = false;
     try {
       for (const [id, value] of JSON.parse(storage?.getItem('dsh-selection-chat.sessions.v1') || '[]')) metadata.set(id, value);
-      for (const id of JSON.parse(storage?.getItem('dsh-selection-chat.cleanup.v1') || '[]')) if (typeof id === 'string' && id.startsWith(TEMP_PREFIX)) cleanupQueue.add(id);
-    } catch { /* 不从损坏缓存推断删除目标。 */ }
-    const publishMeta = () => {
-      try { storage?.setItem('dsh-selection-chat.sessions.v1', JSON.stringify([...metadata])); } catch { /* 当前窗口仍可继续。 */ }
-      for (const listener of metaListeners) listener();
+      for (const id of JSON.parse(storage?.getItem('dsh-selection-chat.cleanup.v1') || '[]')) if (id.startsWith(TEMP_PREFIX)) cleanupQueue.add(id);
+    } catch {}
+    const publish = () => {
+      try { storage?.setItem('dsh-selection-chat.sessions.v1', JSON.stringify([...metadata])); } catch {}
+      for (const fn of listeners) fn();
     };
+    const saveCleanup = () => { try { storage?.setItem('dsh-selection-chat.cleanup.v1', JSON.stringify([...cleanupQueue])); } catch {} };
     const clean = async (id, attempt = 0) => {
       if (disposed || closing.has(id)) return;
       closing.add(id);
       try {
         await temporaryApi('close', { id });
-        cleanupQueue.delete(id); cleanupErrors.delete(id); metadata.delete(id); cards.clear(id);
-        storage?.setItem('dsh-selection-chat.cleanup.v1', JSON.stringify([...cleanupQueue]));
-      } catch (error) {
-        cleanupErrors.set(id, error.message);
+        cleanupQueue.delete(id); cleanupErrors.delete(id); metadata.delete(id); quotes.clear(id); saveCleanup();
+      } catch (e) {
+        cleanupErrors.set(id, e.message);
         if (attempt < 2 && !disposed) {
-          const timer = setTimeout(() => { timers.delete(timer); void clean(id, attempt + 1); }, 1000 * (attempt + 1));
-          timers.add(timer);
+          const timer = setTimeout(() => { timers.delete(timer); void clean(id, attempt + 1); }, 1000 * (attempt + 1)); timers.add(timer);
         }
-      } finally { closing.delete(id); publishMeta(); }
+      } finally { closing.delete(id); publish(); }
     };
     const queueClose = id => {
       if (!id?.startsWith(TEMP_PREFIX)) return;
-      cleanupQueue.add(id);
-      // 关闭标签前先登记清理任务。导航、折叠、资源卸载不会触发这个入口。
-      storage?.setItem('dsh-selection-chat.cleanup.v1', JSON.stringify([...cleanupQueue]));
-      void clean(id);
+      cleanupQueue.add(id); saveCleanup(); void clean(id);
     };
     const getMetadata = async id => {
-      if (id.startsWith(TEMP_PREFIX)) {
-        const info = await temporaryApi('info', { id });
-        if (['closed', 'closing', 'close-failed'].includes(info.state)) throw Error('此临时聊天已关闭，请重新划词打开。');
-        metadata.set(id, info); publishMeta(); return info;
-      }
-      if (!metadata.has(id)) { metadata.set(id, await temporaryApi('info', { id })); publishMeta(); }
-      return metadata.get(id);
-    };
-    const remember = (id, text) => cards.add(id, text);
-    const ensureSender = id => {
-      const binding = ctx.sessions.binding(id);
-      if (!binding) throw Error('当前会话尚未就绪，请稍后重新添加引用。');
-      const shell = ctx.conversation.input.for(binding.ctx);
-      if (!senders.has(shell)) senders.set(shell, attachQuoteSender(shell, cards, id));
+      const info = id.startsWith(TEMP_PREFIX) || !metadata.has(id) ? await temporaryApi('info', { id }) : metadata.get(id);
+      if (['closed', 'closing', 'close-failed'].includes(info.state)) throw Error('此临时聊天已关闭，请重新划词打开。');
+      metadata.set(id, info); publish(); return info;
     };
     const bind = (name, options, Component) => ctx.effect(() => ctx.slots.inject(name, () => ctx.slots.register({ name, ...options }, Component)));
     ctx.effect(() => {
-      const style = document.createElement('style'); style.dataset.plugin = ID;
-      style.textContent = `.dsh-sc-toolbar{position:fixed;z-index:10000;display:flex;flex-wrap:wrap;align-items:center;background:var(--dsw-alias-bg-base,#fff);color:var(--dsw-alias-label-primary,#222);border:1px solid #8883;border-radius:10px;box-shadow:0 4px 16px #0002;font:13px/1.5 system-ui,sans-serif;padding:3px}.dsh-sc-toolbar button{font:inherit;color:inherit;background:transparent;border:0;border-radius:6px;padding:7px 10px;cursor:pointer}.dsh-sc-toolbar button:hover,.dsh-sc-toolbar button:focus-visible{background:#81858d20}.dsh-sc-toolbar button:disabled{opacity:.5;cursor:wait}.dsh-sc-notice{font:13px/1.6 system-ui,sans-serif;white-space:pre-wrap;overflow-wrap:anywhere;padding:8px 12px;border:1px solid #8883;border-radius:8px;margin:6px 0}.dsh-sc-notice button{margin-left:8px;cursor:pointer}.dsh-sc-panel{display:flex;flex-direction:column;flex:1;min-height:0;height:100%;overflow:hidden}.dsh-sc-panel>header{padding:8px 12px;border-bottom:1px solid #8883;font:12px/1.6 system-ui,sans-serif;color:var(--dsw-alias-label-secondary,#777)}.dsh-sc-panel>div:last-child{flex:1;min-height:0;display:flex;flex-direction:column}.dsh-sc-panel [data-slot="selection-chat.conversation"]{flex:1;min-height:0;display:flex;flex-direction:column}`;
-      document.head.append(style);
-      style.textContent += `.dsh-sc-cards{width:100%;box-sizing:border-box;max-height:240px;overflow:auto;margin:0 0 8px;padding:0 4px;display:flex;flex-direction:column;gap:6px}.dsh-sc-card{border:1px solid var(--dsw-alias-border-l1,#8883);border-left:3px solid var(--dsw-alias-state-business-primary,#4d7bea);border-radius:10px;background:var(--dsw-alias-bg-base,#fff);color:var(--dsw-alias-label-primary,#222);padding:9px 12px;font:13px/1.55 system-ui,sans-serif;min-width:0}.dsh-sc-card header{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary,#777)}.dsh-sc-card header span{flex:1}.dsh-sc-card button{border:0;background:transparent;color:inherit;cursor:pointer;border-radius:4px;padding:2px 6px}.dsh-sc-card button:hover{background:#81858d20}.dsh-sc-card button:disabled{opacity:.5;cursor:wait}.dsh-sc-card blockquote{margin:5px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;max-height:70px;overflow:hidden}.dsh-sc-card[data-expanded="true"] blockquote{max-height:none}.dsh-sc-card p{margin:4px 0 0;color:var(--dsw-alias-label-secondary,#777);font-size:12px}`;
-      return () => { disposed = true; style.remove(); for (const off of senders.values()) off(); senders.clear(); };
+      const style = document.createElement('style'); style.dataset.plugin = ID; style.textContent = CSS; document.head.append(style);
+      return () => { disposed = true; style.remove(); for (const timer of timers) clearTimeout(timer); };
     });
     ctx.effect(() => hideTemporarySessions(ctx.sessions.list));
     ctx.effect(() => ctx.sidebarRight.registerCloseHandler('selectionchat', (_owner, tab) => queueClose(parseAddress(tab.contentId))));
-    ctx.effect(() => {
-      for (const id of cleanupQueue) void clean(id);
-      return () => { for (const timer of timers) clearTimeout(timer); timers.clear(); };
-    });
+    ctx.effect(() => { for (const id of cleanupQueue) void clean(id); });
 
-    function SelectionDock({ sessionId, useInput }) {
-      const anchor = useRef(null), toolbar = useRef(null), alive = useRef(false), busyRef = useRef(false), retry = useRef(null);
-      const [pick, setPick] = useState(null), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
-      const [, refresh] = useState(0), [expanded, setExpanded] = useState({});
-      const input = useInput(s => s);
-      const root = () => anchor.current?.closest('[data-conversation-content]');
-      const current = () => {
-        const view = root(), bounds = view?.getBoundingClientRect();
-        // 缓存但隐藏的会话也不得在异步 fork 完成后抢走当前用户的侧栏。
-        return alive.current && !disposed && view?.isConnected && view.getAttribute('data-conversation-session') === sessionId && bounds.width > 0 && bounds.height > 0;
+    function Notice({ message, retry, dismiss }) {
+      return h('div', { className: 'dsh-sc-notice' }, h('span', { role: 'alert' }, message),
+        retry && h('button', { type: 'button', className: 'dsh-sc-button', onClick: retry }, '重试'),
+        dismiss && h('button', { type: 'button', className: 'dsh-sc-button', onClick: dismiss, 'aria-label': '关闭提示' }, '×'));
+    }
+    // 复用原生划词事件与定位，替换 quote 槽位的表面；卸载后宿主原按钮自动恢复。
+    function SelectionActions({ sessionId, readText, clearSelection, dismiss, inputActions, useSession }) {
+      const enabled = useSession(canQuote), alive = useRef(false), busyRef = useRef(false), operation = useRef(null);
+      const [busy, setBusy] = useState(false), [error, setError] = useState('');
+      useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, [sessionId]);
+      useEffect(() => { if (!enabled) dismiss(); }, [enabled, dismiss]);
+      if (!enabled) return null;
+      const quote = () => {
+        const text = readText();
+        if (text === null) { dismiss(); return; }
+        if (insertNativeQuote(inputActions, text)) { clearSelection(); dismiss(); }
       };
-
-      useEffect(() => {
-        alive.current = true;
-        let timer, dragging = false;
-        const update = () => {
-          if (dragging || busyRef.current || toolbar.current?.contains(document.activeElement)) return;
-          const found = readSelection(window.getSelection(), root());
-          setPick(found ? { ...found, sessionId, branch: null } : null);
-        };
-        const schedule = () => { clearTimeout(timer); timer = setTimeout(update, 70); };
-        const down = event => {
-          if (event.target?.closest?.('[data-selection-chat-toolbar]')) return;
-          dragging = true; setPick(null);
-        };
-        const up = () => { dragging = false; schedule(); };
-        const hide = () => { clearTimeout(timer); if (!busyRef.current) setPick(null); };
-        const key = event => {
-          if (event.key === 'Escape') { clearTimeout(timer); setPick(null); return; }
-          if (event.altKey && event.shiftKey && event.code === 'KeyQ') { update(); setTimeout(() => toolbar.current?.querySelector('button')?.focus(), 0); }
-          else schedule();
-        };
-        document.addEventListener('selectionchange', schedule);
-        document.addEventListener('pointerdown', down);
-        document.addEventListener('pointerup', up);
-        document.addEventListener('keyup', key);
-        document.addEventListener('scroll', hide, true);
-        window.addEventListener('resize', hide);
-        return () => {
-          alive.current = false; clearTimeout(timer);
-          document.removeEventListener('selectionchange', schedule);
-          document.removeEventListener('pointerdown', down);
-          document.removeEventListener('pointerup', up);
-          document.removeEventListener('keyup', key);
-          document.removeEventListener('scroll', hide, true);
-          window.removeEventListener('resize', hide);
-        };
-      }, [sessionId]);
-
-      useEffect(() => {
-        const off = cards.subscribe(() => refresh(n => n + 1));
-        const listener = () => refresh(n => n + 1); metaListeners.add(listener);
-        try { ensureSender(sessionId); } catch (e) { setNotice(e.message); }
-        refresh(n => n + 1);
-        return () => { off(); metaListeners.delete(listener); };
-      }, [sessionId]);
-
-      const append = text => {
-        if (!current()) return;
+      const ask = async () => {
+        if (busyRef.current) return;
+        if (!operation.current) {
+          const text = readText(); if (text === null) { dismiss(); return; }
+          operation.current = { text, run: createBranchOp(temporaryApi, address => ctx.sidebarRight.openResource(address), (info, selected) => {
+            metadata.set(info.id, info); quotes.add(info.id, selected); publish();
+          }) };
+        }
+        busyRef.current = true; setBusy(true); setError('');
         try {
-          ensureSender(sessionId);
-          remember(sessionId, text);
-          setPick(null); window.getSelection()?.removeAllRanges();
-          setNotice('');
-          root()?.querySelector('[contenteditable="true"]')?.focus({ preventScroll: true });
-        } catch (e) { setNotice(e.message); }
+          await operation.current.run({ sessionId, text: operation.current.text, isCurrent: () => alive.current && !disposed });
+          if (alive.current) { clearSelection(); dismiss(); }
+        } catch (e) { if (alive.current) setError(e.message); }
+        finally { busyRef.current = false; if (alive.current) setBusy(false); }
       };
-      const ask = async selection => {
-        if (!current() || busyRef.current || selection.sessionId !== sessionId) return;
-        busyRef.current = true; setBusy(true); setNotice('');
-        if (!selection.branch) selection.branch = createBranchOp(temporaryApi, address => ctx.sidebarRight.openResource(address), (info, text) => {
-          metadata.set(info.id, info); publishMeta(); remember(info.id, text);
-        });
-        retry.current = selection;
-        try {
-          const child = await selection.branch({ sessionId, text: selection.text, isCurrent: current });
-          if (current()) { setPick(null); setNotice(''); }
-          return child;
-        } catch (e) {
-          if (current()) setNotice('无法打开侧边聊天：' + e.message + '。可重试打开；如已创建分支将复用它。');
-        } finally { busyRef.current = false; if (alive.current) setBusy(false); }
+      return h('div', null, h('div', { className: 'dsh-sc-actions', role: 'toolbar', 'aria-label': '选中文字', onPointerDown: e => e.preventDefault() },
+        h('button', { type: 'button', className: 'dsh-sc-button', disabled: busy, onClick: quote }, '引用文本'),
+        h('span', { className: 'dsh-sc-separator', 'aria-hidden': true }),
+        h('button', { type: 'button', className: 'dsh-sc-button', disabled: busy, onClick: ask }, busy ? h('span', { className: 'dsh-sc-spinner' }) : h(Icon), busy ? '正在打开' : '侧边提问')),
+        error && h(Notice, { message: error, retry: ask }));
+    }
+    function PendingDock({ sessionId, inputActions, useInput }) {
+      const phase = useInput(s => s.phase), [, refresh] = useState(0), [error, setError] = useState('');
+      useEffect(() => {
+        const fn = () => refresh(n => n + 1), off = quotes.subscribe(fn); listeners.add(fn);
+        return () => { off(); listeners.delete(fn); };
+      }, [sessionId]);
+      const deliver = (legacy = false) => {
+        if (!quotes.deliver(sessionId, inputActions, legacy)) setError('输入框暂不可添加引用，请结束当前提交后重试。');
+        else setError('');
       };
-      const disabled = busy || ['adjudicating', 'submitting'].includes(input.phase);
-      return h('div', { ref: anchor, 'data-selection-chat-dock': sessionId },
-        cleanupErrors.size > 0 && h('div', { className: 'dsh-sc-notice', role: 'alert' }, '临时侧边聊天清理失败：' + [...cleanupErrors.values()].join('；'),
-          h('button', { onClick: () => { for (const id of cleanupErrors.keys()) void clean(id); } }, '重试清理')),
-        cards.list(sessionId).length > 0 && h('div', { className: 'dsh-sc-cards', 'aria-label': '待发送引用' },
-          cards.list(sessionId).map(card => h('section', { key: card.id, className: 'dsh-sc-card', 'data-expanded': !!expanded[card.id] },
-            h('header', null, h('span', null, card.state === 'sending' ? '引用 · 正在提交…' : '引用当前对话'),
-              h('button', { 'aria-expanded': !!expanded[card.id], onClick: () => setExpanded(v => ({ ...v, [card.id]: !v[card.id] })) }, expanded[card.id] ? '收起' : '展开'),
-              h('button', { 'aria-label': '移除这条引用', disabled: card.state === 'sending', onClick: () => cards.remove(sessionId, card.id) }, '×')),
-            h('blockquote', null, card.text),
-            card.error && h('p', { role: 'status' }, card.error),
-            card.state === 'uncertain' && h('p', null, '上次发送结果未确认。请先检查历史；此引用不会自动附加。',
-              h('button', { onClick: () => cards.reuse(sessionId, card.id) }, '确认重新使用'))))),
-        notice && h('div', { className: 'dsh-sc-notice', role: 'status' }, notice,
-          retry.current && notice.startsWith('无法') && h('button', { onClick: () => ask(retry.current), disabled }, '重试打开'),
-          h('button', { onClick: () => setNotice('') }, '关闭提示')),
-        pick && createPortal(h('div', { ref: toolbar, className: 'dsh-sc-toolbar', role: 'toolbar', 'aria-label': '划选文字操作', 'data-selection-chat-toolbar': '',
-          style: toolbarPosition(pick.rect, window.innerWidth, window.innerHeight), onPointerDown: event => event.preventDefault() },
-          h('button', { disabled, onClick: () => append(pick.text) }, '添加到对话'),
-          h('button', { disabled, onClick: () => ask(pick) }, busy ? '正在打开…' : '在侧边聊天中提问')), document.body));
+      useEffect(() => { if (phase === 'plain') deliver(); }, [sessionId, phase, inputActions]);
+      const legacy = quotes.list(sessionId).filter(q => q.legacy);
+      return h('div', { 'data-selection-chat-dock': sessionId },
+        legacy.length > 0 && h('div', { className: 'dsh-sc-recover' },
+          h('span', null, legacy.some(q => q.uncertain) ? '旧版引用发送结果未确认，请先检查聊天记录。' : `有 ${legacy.length} 条旧版引用待恢复`),
+          h('button', { type: 'button', className: 'dsh-sc-button', onClick: () => deliver(true) }, '恢复到输入框'),
+          h('button', { type: 'button', className: 'dsh-sc-button', onClick: () => quotes.clear(sessionId) }, '丢弃')),
+        error && h(Notice, { message: error, retry: () => deliver(), dismiss: () => setError('') }),
+        cleanupErrors.size > 0 && h(Notice, { message: '临时聊天清理失败：' + [...cleanupErrors.values()].join('；'), retry: () => { for (const id of cleanupErrors.keys()) void clean(id); } }));
     }
     function FixedChat(props) { return props.renderSlot('conversation.session', { view: 'chat' }); }
     function Conversation({ useSession, useConversation, renderFactorySlot }) {
       const session = useSession(s => s), conversation = useConversation(s => s);
       const active = conversation.activeTargets.size > 0 || !session.blank && !session.awaitingFirstTurn || session.running;
       const hero = !active && session.openState === 'open';
-      if (session.openError) return h('div', { role: 'alert', className: 'dsh-sc-notice' }, '会话加载失败：' + (session.openError.message || String(session.openError)));
+      if (session.openError) return h(Notice, { message: '会话加载失败：' + (session.openError.message || String(session.openError)) });
       return renderFactorySlot('conversation.content', { variant: 'embedded', phase: active ? 'active' : hero ? 'hero' : 'settling', hero }, { slots: { views: FixedChat } });
     }
     function SideTab({ useResource, useTabInfo, SessionProvider, renderSlot }) {
-      const { tab } = useTabInfo(), resource = useResource(tab.contentId);
-      const panel = useRef(null);
+      const { tab } = useTabInfo(), resource = useResource(tab.contentId), panel = useRef(null);
       const [saving, setSaving] = useState(false), [error, setError] = useState('');
-      const id = resource.value?.id, meta = metadata.get(id) || resource.value?.meta;
-      const temporary = !!id?.startsWith(TEMP_PREFIX);
+      const id = resource.value?.id, meta = metadata.get(id) || resource.value?.meta, temporary = !!id?.startsWith(TEMP_PREFIX);
       useEffect(() => {
         const root = panel.current, hidden = new Set(meta?.hiddenTurns || []), owned = new Set();
         if (!root || hidden.size === 0) return;
-        // 同步 hidden 属性，让宿主滚动/间距计算也排除继承行，而不只在视觉上覆盖。
         const update = () => {
           for (const row of root.querySelectorAll('[data-chat-turn]')) {
             const raw = row.getAttribute('data-chat-turn'), hide = raw !== '' && hidden.has(Number(raw));
@@ -418,39 +286,39 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
           }
         };
         const observer = new MutationObserver(update);
-        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-chat-turn', 'hidden'] });
-        update();
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-chat-turn', 'hidden'] }); update();
         return () => { observer.disconnect(); for (const row of owned) row.hidden = false; };
       }, [id, meta]);
       const save = async () => {
         if (saving || !id) return;
         setSaving(true); setError('');
         try {
-          if (cards.list(id).some(c => c.state === 'sending')) throw Error('请等待当前消息提交完成后保存。');
+          const binding = ctx.sessions.binding(id);
+          // 保存后切换到长期会话，先处理未发送草稿，避免留在旧临时输入框中。
+          if (quotes.list(id).length || binding && hasUnsentDraft(ctx.conversation.input.for(binding.ctx))) throw Error('请先发送或清空输入框中的草稿和引用，再保存会话。');
           const info = await temporaryApi('save', { id });
-          metadata.set(id, info);
-          metadata.set(info.savedId, { ...info, id: info.savedId, state: 'saved' });
-          cards.move(id, info.savedId); publishMeta();
-          // 原生标签替换绑定原主会话，切换主会话期间也不会保存到错误的目录。
+          metadata.set(id, info); metadata.set(info.savedId, { ...info, id: info.savedId, state: 'saved' }); publish();
           await tab.actions.openResource(resourceAddress(info.savedId), { replaceTab: true });
         } catch (e) { setError(e.message); } finally { setSaving(false); }
       };
-      return h('section', { ref: panel, className: 'dsh-sc-panel', 'aria-label': '划词侧边聊天', 'data-selection-chat-session': id },
+      return h('section', { ref: panel, className: 'dsh-sc-panel', 'aria-label': '侧边对话', 'data-selection-chat-session': id },
         h('style', null, inheritedHistoryCss(id || '', meta?.hiddenTurns || [])),
-        h('header', { style: { display: 'flex', alignItems: 'center', gap: 8 } }, h('span', null, temporary ? '临时聊天' : '已保存'),
-          temporary && h('button', { onClick: save, disabled: saving, style: { marginLeft: 'auto', cursor: 'pointer' } }, saving ? '正在保存…' : meta?.savedId ? '打开已保存会话' : '保存')),
-        error && h('div', { role: 'alert', className: 'dsh-sc-notice' }, error),
-        resource.error && h('div', { role: 'alert', className: 'dsh-sc-notice' }, '侧边会话加载失败：' + (resource.error.message || String(resource.error))),
-        h('div', null, resource.value ? h(SessionProvider, { session: resource.value.reference }, renderSlot(SLOT, {})) : h('p', null, '正在加载侧边会话…')));
+        h('header', { className: 'dsh-sc-header' }, h(Icon), h('span', { className: 'dsh-sc-title' }, '侧边对话'),
+          id && h('span', { className: 'dsh-sc-state' }, temporary ? '临时' : '已保存'),
+          temporary && h('button', { type: 'button', className: 'dsh-sc-button dsh-sc-save', onClick: save, disabled: saving, title: '保存到来源会话的目录' },
+            saving ? h('span', { className: 'dsh-sc-spinner' }) : h(Icon, { kind: 'save' }), saving ? '正在保存' : meta?.savedId ? '打开已保存' : '保存'),
+          id && !temporary && h('span', { className: 'dsh-sc-state dsh-sc-save', title: '已保存到来源目录' }, h(Icon, { kind: 'check' }))),
+        error && h(Notice, { message: error, dismiss: () => setError('') }),
+        resource.error && h(Notice, { message: '侧边会话加载失败：' + (resource.error.message || String(resource.error)) }),
+        h('div', { className: 'dsh-sc-content' }, resource.value ? h(SessionProvider, { session: resource.value.reference }, renderSlot(SLOT, {})) : h('div', { className: 'dsh-sc-loading', role: 'status' }, h('span', { className: 'dsh-sc-spinner' }), '正在打开侧边对话')));
     }
     ctx.effect(() => ctx.resources.register(resourceProvider(ctx.sessions, getMetadata)));
-    ctx.effect(() => ctx.sidebarRightTabs.register({ id: ID, kind: 'selectionchat', patterns: [PREFIX + '**'], priority: 'extension', canOpen: address => !!parseAddress(address), title: address => '侧边聊天 · ' + (parseAddress(address)?.slice(-6) || '') }));
+    ctx.effect(() => ctx.sidebarRightTabs.register({ id: ID, kind: 'selectionchat', patterns: [PREFIX + '**'], priority: 'extension', canOpen: address => !!parseAddress(address), title: () => '侧边对话' }));
     bind('sidebar.right.pane.tab', { key: ID, children: { [SLOT]: { kind: 'single', scope: 'session' } } }, SideTab);
     bind(SLOT, {}, Conversation);
-    bind('conversation.input.dock', { id: ID, order: 80 }, SelectionDock);
+    bind('conversation.input.dock', { id: ID, order: 80 }, PendingDock);
+    bind('conversation.chat.text-interaction', { key: 'quote', priority: 100 }, SelectionActions);
   }
   return { apply, inject: ['slots', 'sessions', 'resources', 'conversation', 'uiSession', 'uiConversation', 'sidebarRight', 'sidebarRightTabs'],
-    // 纯函数与生命周期边界导出供离线测试，不调用模型、不操作用户窗口。
-    quoteText, parseAddress, resourceAddress, toolbarPosition, readSelection, createQuoteStore, attachQuoteSender, resourceProvider, createBranchOp,
-    hideTemporarySessions, inheritedHistoryCss };
+    insertNativeQuote, canQuote, hasUnsentDraft, createPendingQuotes, parseAddress, resourceAddress, resourceProvider, createBranchOp, hideTemporarySessions, inheritedHistoryCss };
 } });
