@@ -63,7 +63,7 @@ test('原生引用菜单只注册一个扩展面板，引用按钮委托宿主�
     sessions: { list: { getSnapshot: () => ({ ids: [], byId: {} }) } }, sidebarRight: { registerCloseHandler: () => () => {} },
     resources: { register: () => () => {} }, sidebarRightTabs: { register: () => () => {} } });
   const action = registered.find(r => r.options.name === 'conversation.chat.text-interaction');
-  assert.equal(action.options.key, 'quote'); assert.equal(action.options.priority, 100);
+  assert.equal(action.options.key, 'quote'); assert.ok(action.options.priority < 0);
   const calls = [], tree = action.component({ sessionId: 'a', readText: () => '选中文字', clearSelection: () => calls.push('clear'), dismiss: () => calls.push('dismiss'),
     useSession: fn => fn({ removed: false, subagent: null }), inputActions: { insertQuote: text => { calls.push(text); return true; } } });
   effects.forEach(fn => fn());

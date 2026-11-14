@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-selection-chat",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "type": "module",
   "description": "DSH 原生文本引用与临时侧边聊天",

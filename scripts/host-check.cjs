@@ -51,7 +51,8 @@ async function main() {
   const nativeInsert = vm.runInNewContext('({' + parts.methods.get('insertQuote') + '}).insertQuote');
   let client;
   vm.runInNewContext(fs.readFileSync(path.join(root, 'client.js'), 'utf8'), {
-    window: { __ModuleLoader__: { load: definition => { client = definition.factory(() => ({})); } } }, URL
+    window: { __ModuleLoader__: { load: definition => { client = definition.factory(() => ({})); } } }, URL,
+    document: { createElement: () => ({ dataset: {}, remove() {} }), head: { append() {} } }
   });
   // 执行真实 Shell.insertQuote，编辑器的预览和发送仍完整由宿主处理。
   const inserted = []; let focused = 0, allowed = true;
@@ -77,6 +78,34 @@ async function main() {
     return next(name, name.startsWith('@deepseek-ai/') ? { ...context, parentURL: pathToFileURL(path.join(runtime, 'package.json')).href } : context);
   } });
   const { Context } = await import('@deepseek-ai/cordis');
+  // 此版本把纯前端注册表打进网页包，不能从后端 node_modules 直接导入。
+  const assets = path.join(hostPackage('dsh-web-frontend'), 'dist/assets');
+  const bundle = fs.readdirSync(assets).filter(name => /^index-.*\.js$/.test(name))
+    .map(name => fs.readFileSync(path.join(assets, name), 'utf8')).find(source => source.includes('lowest renders'));
+  const coreName = bundle.match(/SlotCore:(\w+)/)[1], helperName = bundle.match(/standardHookPropName:(\w+)/)[1];
+  const statements = parse(bundle, { ecmaVersion: 'latest', sourceType: 'module' }).body;
+  const first = statements.find(node => node.type === 'FunctionDeclaration' && node.id.name === helperName);
+  const last = statements.find(node => node.type === 'VariableDeclaration' && node.declarations.some(d => d.id.name === coreName));
+  const SlotCore = vm.runInNewContext(bundle.slice(first.start, last.end) + ';' + coreName, { queueMicrotask });
+  // 用真实槽位注册表验证最终渲染者，不能仅断言插件提交了注册参数。
+  for (const nativeFirst of [true, false]) {
+    const core = new SlotCore(), slot = 'conversation.chat.text-interaction', disposers = [];
+    const rootOff = core.register({ name: 'root', children: { [slot]: { kind: 'keyed', scope: 'session' } } }, () => null);
+    const native = () => null;
+    let nativeOff;
+    if (nativeFirst) nativeOff = core.register({ name: slot, key: 'quote' }, native);
+    client.apply({ effect: fn => { const off = fn(); disposers.push(off); return off; },
+      slots: { inject: (_, fn) => fn(), register: (options, component) => options.name === slot ? core.register(options, component) : () => {} },
+      sessions: { list: { getSnapshot: () => ({ ids: [], byId: {} }) } },
+      sidebarRight: { registerCloseHandler: () => () => {} }, resources: { register: () => () => {} }, sidebarRightTabs: { register: () => () => {} } });
+    if (!nativeFirst) nativeOff = core.register({ name: slot, key: 'quote' }, native);
+    const entries = core.entriesOfSlot(slot);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].component.name, 'SelectionActions', '原生引用按钮遮住了插件菜单');
+    for (const off of disposers.reverse()) off?.();
+    assert.equal(core.entriesOfSlot(slot)[0].component, native, '卸载后应恢复原生引用按钮');
+    nativeOff(); rootOff();
+  }
   const { buildForkSeed } = await import('@deepseek-ai/dsh-session');
   const { default: AgentLoop } = await import('@deepseek-ai/dsh-agent-loop');
   const plugin = await import(pathToFileURL(path.join(root, 'index.mjs')));
@@ -121,7 +150,7 @@ async function main() {
     const fiber = await ctx.plugin(plugin);
     await fiber.dispose();
     console.log(JSON.stringify({ ok: true, plugin: pkg.name, version: pkg.version, dsh: version,
-      checks: ['真实 Cordis 加载及认证路由注册和卸载', '原生引用菜单槽位与客户端依赖', '真实 insertQuote：换行、完整原文、焦点、禁用及提交阶段', '真实 AgentLoop：临时无日志、保存恢复持久化；原生 fork seed'],
+      checks: ['真实 Cordis 加载及认证路由注册和卸载', '真实 SlotCore：两种加载顺序选中插件菜单、卸载恢复原生按钮', '真实 insertQuote：换行、完整原文、焦点、禁用及提交阶段', '真实 AgentLoop：临时无日志、保存恢复持久化；原生 fork seed'],
       limits: ['未执行真实浏览器渲染', '未新建真实会话或发送消息；界面由用户手动验收'] }));
   } finally { await ctx.fiber.dispose(); }
 }

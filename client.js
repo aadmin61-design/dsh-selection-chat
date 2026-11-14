@@ -317,7 +317,8 @@ window.__ModuleLoader__.load({ id: '@local/dsh-selection-chat', factory: require
     bind('sidebar.right.pane.tab', { key: ID, children: { [SLOT]: { kind: 'single', scope: 'session' } } }, SideTab);
     bind(SLOT, {}, Conversation);
     bind('conversation.input.dock', { id: ID, order: 80 }, PendingDock);
-    bind('conversation.chat.text-interaction', { key: 'quote', priority: 100 }, SelectionActions);
+    // DSH 槽位按数值升序取首项；低于原生的 0 才能显示两个操作按钮。
+    bind('conversation.chat.text-interaction', { key: 'quote', priority: -100 }, SelectionActions);
   }
   return { apply, inject: ['slots', 'sessions', 'resources', 'conversation', 'uiSession', 'uiConversation', 'sidebarRight', 'sidebarRightTabs'],
     insertNativeQuote, canQuote, hasUnsentDraft, createPendingQuotes, parseAddress, resourceAddress, resourceProvider, createBranchOp, hideTemporarySessions, inheritedHistoryCss };

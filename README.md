@@ -1,10 +1,10 @@
-# DSH Selection Chat 1.4.0
+# DSH Selection Chat 1.4.1
 
 为 DSH 原生划词菜单增加**侧边提问**，在右侧打开临时聊天。文本引用改用 DSH 原生功能，引用预览、编辑和发送均由宿主处理。
 
 适用于 **DSH 0.2.2-rc.3**。独立插件，不依赖 Codex 或 codex-dots，不需要安装 Node、Python 或构建环境。DSH 0.2.1 用户请保留插件 1.3.0。
 
-[下载安装包](https://github.com/aadmin61-design/dsh-selection-chat/releases/download/v1.4.0/dsh-selection-chat-1.4.0.zip) · [版本发布](https://github.com/aadmin61-design/dsh-selection-chat/releases) · [更新记录](CHANGELOG.md)
+[下载安装包](https://github.com/aadmin61-design/dsh-selection-chat/releases/download/v1.4.1/dsh-selection-chat-1.4.1.zip) · [版本发布](https://github.com/aadmin61-design/dsh-selection-chat/releases) · [更新记录](CHANGELOG.md)
 
 ## 功能
 
@@ -32,14 +32,14 @@
 
 ## 安装与升级
 
-1. 从 [Releases](https://github.com/aadmin61-design/dsh-selection-chat/releases/latest) 下载 `dsh-selection-chat-1.4.0.zip`。
+1. 从 [Releases](https://github.com/aadmin61-design/dsh-selection-chat/releases/latest) 下载 `dsh-selection-chat-1.4.1.zip`。
 2. 解压其中的 `dsh-selection-chat` 文件夹到固定位置，例如 `C:\dsh-plugins\dsh-selection-chat`。
 3. 打开 DSH → 插件 → 添加插件，填写该文件夹的**绝对路径**，安装并启用。
-4. 若提示重启，先保存需要保留的临时聊天并结束任务，再手动重启。插件详情应显示 `@local/dsh-selection-chat`、`v1.4.0`。
+4. 若提示重启，先保存需要保留的临时聊天并结束任务，再手动重启。插件详情应显示 `@local/dsh-selection-chat`、`v1.4.1`。
 
 源码安装填写实际包含 `package.json`、`index.mjs`、`temporary.mjs`、`client.js` 和 `cordis.patch.yml` 的目录；不需要 `npm install`。链接安装后请保留原目录。
 
-**升级**：先保存临时聊天，解压新包覆盖原插件目录，再手动重启 DSH。依赖被停用时，在插件详情重新启用。1.4.0 依赖新版原生引用模块，不能安装到 DSH 0.2.1。
+**升级**：先保存临时聊天，解压新包覆盖原插件目录，再手动重启 DSH。依赖被停用时，在插件详情重新启用。1.4.1 依赖新版原生引用模块，不能安装到 DSH 0.2.1。
 
 同一窗口中仍有旧版引用缓存时，会出现一次恢复入口；点击“恢复到输入框”交给原生编辑器，或点击“丢弃”。如果旧引用曾在发送中，先检查历史确认是否已发送，再决定是否恢复。已交给原生编辑器的引用由 DSH 管理，不再保存在插件卡片中。
 
@@ -83,6 +83,6 @@ try {
 } finally { Remove-Item Env:ELECTRON_RUN_AS_NODE }
 ```
 
-1.4.0 的 26 项离线测试和本机 DSH 0.2.2-rc.3 宿主检查通过，覆盖原生引用交接、旧缓存恢复、菜单注册、分支去重、临时清理、保存与来源目录。宿主检查执行安装包中的真实 `insertQuote` 方法，并验证 Cordis 加载及临时会话持久化入口。未执行真实界面渲染或模型调用，界面按上表手动验收。
+1.4.1 的 26 项离线测试和本机 DSH 0.2.2-rc.3 宿主检查通过，覆盖原生引用交接、旧缓存恢复、菜单注册、分支去重、临时清理、保存与来源目录。宿主检查验证真实 SlotCore 在两种加载顺序下选择插件菜单、卸载后恢复原生按钮，并执行安装包中的真实 `insertQuote` 方法，并验证 Cordis 加载及临时会话持久化入口。未执行真实界面渲染或模型调用，界面按上表手动验收。
 
 插件复用原生 `conversation.chat.text-interaction` 菜单槽位与 `inputActions.insertQuote`。临时会话沿用定向写句柄适配，左侧目录过滤临时 ID，侧栏按继承轮次隐藏旧历史。没有修改 DSH 安装文件。发行包不含 DSH 源码、账号、会话历史或本机检查数据。
